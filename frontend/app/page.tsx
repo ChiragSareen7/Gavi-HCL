@@ -2,154 +2,118 @@
 
 import React, { useMemo, useState } from "react";
 
-type ModelOut = {
-  label: "SCAM" | "NOT_SCAM" | "UNCERTAIN";
-  confidence: number;
-  reply: string;
-  raw: string;
-};
-
-type CompareResp = {
-  base: ModelOut;
-  finetuned: ModelOut;
-  confidence_delta: number;
-  decision_delta: string;
-};
+type HackathonResp = { status: string; reply: string };
 
 export default function Page() {
-  const [text, setText] = useState(
+  const [sessionId, setSessionId] = useState("test-session-1");
+  const [messageText, setMessageText] = useState(
     "KYC pending. Your bank account will be blocked in 2 hours. Click http://sbi-kyc-help.in to update."
   );
-  const [context, setContext] = useState("");
+  const [apiKey, setApiKey] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [resp, setResp] = useState<CompareResp | null>(null);
+  const [resp, setResp] = useState<HackathonResp | null>(null);
 
   const apiBase = useMemo(() => {
     return process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
   }, []);
 
-  async function runCompare() {
+  async function sendMessage() {
     setLoading(true);
     setError(null);
     setResp(null);
     try {
-      const r = await fetch(`${apiBase}/compare`, {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (apiKey.trim()) headers["x-api-key"] = apiKey.trim();
+      const r = await fetch(`${apiBase}/v1/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, context: context.trim() || null }),
+        headers,
+        body: JSON.stringify({
+          sessionId: sessionId.trim() || "test-session-1",
+          message: { sender: "scammer", text: messageText.trim(), timestamp: new Date().toISOString() },
+          conversationHistory: null,
+          metadata: {},
+        }),
       });
       if (!r.ok) {
-        const msg = await r.text();
-        throw new Error(msg || `HTTP ${r.status}`);
+        const text = await r.text();
+        let msg = text || `HTTP ${r.status}`;
+        try {
+          const j = JSON.parse(text) as { detail?: string };
+          if (j?.detail) msg = j.detail;
+        } catch {
+          /* */
+        }
+        throw new Error(msg);
       }
-      const j = (await r.json()) as CompareResp;
+      const j = (await r.json()) as HackathonResp;
       setResp(j);
-    } catch (e: any) {
-      setError(e?.message || String(e));
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
   }
 
   return (
-    <main style={{ fontFamily: "ui-sans-serif, system-ui", padding: 24, maxWidth: 1100, margin: "0 auto" }}>
-      <h2 style={{ marginBottom: 8 }}>Scam Classifier Compare (Base vs Fine-tuned)</h2>
+    <main style={{ fontFamily: "ui-sans-serif, system-ui", padding: 24, maxWidth: 700, margin: "0 auto" }}>
+      <h2 style={{ marginBottom: 8 }}>Honeypot API — local test</h2>
       <p style={{ marginTop: 0, color: "#555" }}>
-        Sends text to backend <code>{apiBase}</code> and renders both model JSON outputs.
+        Calls <code>POST {apiBase}/v1/chat</code> (hackathon contract). Not used in evaluation.
       </p>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 16 }}>
-        <div>
-          <div style={{ fontWeight: 600, marginBottom: 6 }}>Incoming message</div>
-          <textarea
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            rows={6}
-            style={{ width: "100%", padding: 12, borderRadius: 10, border: "1px solid #ddd" }}
-          />
-        </div>
-        <div>
-          <div style={{ fontWeight: 600, marginBottom: 6 }}>Optional context (prior turns)</div>
-          <textarea
-            value={context}
-            onChange={(e) => setContext(e.target.value)}
-            rows={6}
-            placeholder="(Conversation so far)\nScammer: ...\nAman: ..."
-            style={{ width: "100%", padding: 12, borderRadius: 10, border: "1px solid #ddd" }}
-          />
-        </div>
+      <div style={{ marginBottom: 12 }}>
+        <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>Session ID</label>
+        <input
+          type="text"
+          value={sessionId}
+          onChange={(e) => setSessionId(e.target.value)}
+          style={{ width: "100%", padding: 8, borderRadius: 8, border: "1px solid #ddd" }}
+        />
+      </div>
+      <div style={{ marginBottom: 12 }}>
+        <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>x-api-key (if backend requires)</label>
+        <input
+          type="password"
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          placeholder="Leave empty if HONEYPOT_API_KEY not set"
+          style={{ width: "100%", padding: 8, borderRadius: 8, border: "1px solid #ddd" }}
+        />
+      </div>
+      <div style={{ marginBottom: 12 }}>
+        <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>Message (scammer text)</label>
+        <textarea
+          value={messageText}
+          onChange={(e) => setMessageText(e.target.value)}
+          rows={4}
+          style={{ width: "100%", padding: 12, borderRadius: 10, border: "1px solid #ddd" }}
+        />
       </div>
 
-      <div style={{ marginTop: 12, display: "flex", gap: 12, alignItems: "center" }}>
-        <button
-          onClick={runCompare}
-          disabled={loading || !text.trim()}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 10,
-            border: "1px solid #111",
-            background: loading ? "#eee" : "#111",
-            color: loading ? "#333" : "#fff",
-            cursor: loading ? "not-allowed" : "pointer",
-          }}
-        >
-          {loading ? "Running..." : "Compare"}
-        </button>
-        {error ? <span style={{ color: "#b00020" }}>{error}</span> : null}
-      </div>
+      <button
+        onClick={sendMessage}
+        disabled={loading || !messageText.trim()}
+        style={{
+          padding: "10px 14px",
+          borderRadius: 10,
+          border: "1px solid #111",
+          background: loading ? "#eee" : "#111",
+          color: loading ? "#333" : "#fff",
+          cursor: loading ? "not-allowed" : "pointer",
+        }}
+      >
+        {loading ? "Sending..." : "Send"}
+      </button>
+      {error ? <span style={{ marginLeft: 12, color: "#b00020" }}>{error}</span> : null}
 
       {resp ? (
-        <div style={{ marginTop: 18 }}>
-          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", color: "#333" }}>
-            <div>
-              <strong>Decision delta:</strong> {resp.decision_delta}
-            </div>
-            <div>
-              <strong>Confidence delta:</strong> {resp.confidence_delta.toFixed(3)}
-            </div>
-          </div>
-
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 12 }}>
-            <Card title="Base model" out={resp.base} />
-            <Card title="Fine-tuned model" out={resp.finetuned} />
-          </div>
+        <div style={{ marginTop: 18, padding: 14, background: "#f5f5f5", borderRadius: 10 }}>
+          <div style={{ fontWeight: 600, marginBottom: 6 }}>Response: status = {resp.status}</div>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>Reply</div>
+          <div style={{ whiteSpace: "pre-wrap" }}>{resp.reply}</div>
         </div>
       ) : null}
     </main>
   );
 }
-
-function Card({ title, out }: { title: string; out: ModelOut }) {
-  return (
-    <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 14 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-        <div style={{ fontWeight: 700 }}>{title}</div>
-        <div style={{ fontSize: 13, color: "#555" }}>
-          <span style={{ marginRight: 10 }}>
-            <strong>label</strong>: {out.label}
-          </span>
-          <span>
-            <strong>conf</strong>: {out.confidence.toFixed(3)}
-          </span>
-        </div>
-      </div>
-
-      <div style={{ marginTop: 10 }}>
-        <div style={{ fontWeight: 600, marginBottom: 4 }}>Reply (Aman)</div>
-        <div style={{ whiteSpace: "pre-wrap", background: "#fafafa", border: "1px solid #eee", padding: 10, borderRadius: 10 }}>
-          {out.reply}
-        </div>
-      </div>
-
-      <div style={{ marginTop: 10 }}>
-        <div style={{ fontWeight: 600, marginBottom: 4 }}>Raw JSON</div>
-        <pre style={{ margin: 0, fontSize: 12, overflowX: "auto", background: "#0b1020", color: "#e8ecff", padding: 10, borderRadius: 10 }}>
-          {out.raw}
-        </pre>
-      </div>
-    </div>
-  );
-}
-
-

@@ -6,6 +6,9 @@ peft==0.12.0
 # Skip on macOS so you can run backend/eval/UI locally; use it on Linux GPU boxes for QLoRA.
 bitsandbytes==0.42.0; platform_system != "Darwin"
 pyyaml==6.0.2
+# Tokenizer deps for LLaMA/Mistral (sentencepiece) and fast tokenizers (protobuf)
+sentencepiece>=0.2.0
+protobuf>=4.0
 trl==0.10.1
 torch>=2.3.0
 fastapi==0.115.6

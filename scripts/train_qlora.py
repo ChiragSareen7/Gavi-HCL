@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -8,13 +9,26 @@ import torch
 import yaml
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    TrainingArguments,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from trl import SFTTrainer
+
+
+def _patch_accelerate_optimizer_for_macos():
+    """Work around transformers Trainer calling optimizer.train(): PyTorch optimizers don't have .train()."""
+    try:
+        from accelerate.optimizer import AcceleratedOptimizer
+
+        def _train_noop_if_missing(self):
+            if hasattr(self.optimizer, "train"):
+                return self.optimizer.train()
+            # PyTorch AdamW etc. have no .train(); no-op.
+
+        AcceleratedOptimizer.train = _train_noop_if_missing
+    except Exception:
+        pass
+
+
+_patch_accelerate_optimizer_for_macos()
 
 
 """
@@ -138,8 +152,21 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # QLoRA (4-bit) requires bitsandbytes, which we skip on macOS. Use half-precision LoRA on Mac.
+    use_4bit = bool(cfg.use_4bit)
+    if sys.platform == "darwin":
+        use_4bit = False
+        print("macOS detected: using half-precision LoRA (QLoRA not available).")
+    elif use_4bit:
+        try:
+            import bitsandbytes  # noqa: F401  # optional; not installed on macOS
+        except ImportError:
+            use_4bit = False
+            print("bitsandbytes not installed. Using half-precision LoRA instead of QLoRA.")
+
     quant_config = None
-    if cfg.use_4bit:
+    if use_4bit:
+        from transformers import BitsAndBytesConfig
         quant_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type=cfg.bnb_4bit_quant_type,
@@ -147,14 +174,15 @@ def main() -> None:
             bnb_4bit_use_double_quant=True,
         )
 
+    compute_dtype = dtype_from_name(cfg.bnb_4bit_compute_dtype)
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name_or_path,
         quantization_config=quant_config,
         device_map="auto",
-        torch_dtype=(dtype_from_name(cfg.bnb_4bit_compute_dtype) if cfg.use_4bit else None),
+        torch_dtype=compute_dtype if not use_4bit else None,
     )
 
-    if cfg.use_4bit:
+    if use_4bit:
         model = prepare_model_for_kbit_training(model)
 
     lora_config = LoraConfig(
@@ -175,6 +203,7 @@ def main() -> None:
     train_ds = to_text(train_rows, tokenizer)
     eval_ds = to_text(eval_rows, tokenizer)
 
+    # eval_strategy (4.46+); pin_memory=False on macOS (MPS doesn't support it)
     training_args = TrainingArguments(
         output_dir=cfg.output_dir,
         num_train_epochs=cfg.num_train_epochs,
@@ -186,14 +215,15 @@ def main() -> None:
         warmup_ratio=cfg.warmup_ratio,
         lr_scheduler_type=cfg.lr_scheduler_type,
         logging_steps=cfg.logging_steps,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=cfg.eval_steps,
         save_strategy="steps",
         save_steps=cfg.save_steps,
         save_total_limit=cfg.save_total_limit,
-        bf16=torch.cuda.is_available(),  # safe default for modern GPUs; override if needed
+        bf16=torch.cuda.is_available(),
         report_to="none",
         seed=cfg.seed,
+        dataloader_pin_memory=(sys.platform != "darwin"),
     )
 
     # SFTTrainer handles standard causal LM supervised fine-tuning.

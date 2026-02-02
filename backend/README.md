@@ -1,13 +1,12 @@
-## Backend (FastAPI)
+## Backend (FastAPI) — Agentic Honeypot
 
 ### Env vars
-- `GROQ_BASE_URL`: Groq OpenAI-compatible base URL
-- `GROQ_API_KEY`: API key (do not commit)
-- `BASE_MODEL`: base model name (e.g., a LLaMA/Mistral instruct)
-- `FT_MODEL`: fine-tuned model name (or the served adapter endpoint name)
+- `GROQ_BASE_URL`, `GROQ_API_KEY`, `BASE_MODEL`: Groq API.
+- `FT_MODEL`, `FT_BASE_URL`, `FT_API_KEY`: Fine-tuned model (local or Groq).
+- **`CALLBACK_URL`**: Mandatory for hackathon; POST payload when `conversation_ended=true`.
 
 ### Local .env
-Create `backend/.env` (not committed) based on `backend/env.example`.
+Create `backend/.env` from `backend/env.example`. Set `FT_BASE_URL`, `CALLBACK_URL`, and run the FT inference server for local FT model.
 
 ### Run
 
@@ -16,22 +15,15 @@ uvicorn backend.app:app --host 0.0.0.0 --port 8000
 ```
 
 ### Endpoints
+
+**Public API (evaluation): POST /v1/chat**
+
+Request: `{ "session_id": "…", "message": "…", "conversation_history": [{"role":"scammer|agent","content":"…"}] }`  
+Response: `{ "reply", "scam_detected", "confidence", "intelligence", "conversation_ended", "callback_sent" }`.  
+When `conversation_ended=true`, backend POSTs to `CALLBACK_URL`.
+
+**Dev / health**
 - `GET /health`
-- `POST /compare`
-
-Request:
-```json
-{ "text": "…", "context": "optional prior context" }
-```
-
-Response:
-```json
-{
-  "base": {"label":"…","confidence":0.0,"reply":"…","raw":"…"},
-  "finetuned": {"label":"…","confidence":0.0,"reply":"…","raw":"…"},
-  "confidence_delta": 0.0,
-  "decision_delta": "same|NOT_SCAM -> SCAM|..."
-}
-```
+- `POST /compare` — base vs fine-tuned reply (dev only)
 
 
