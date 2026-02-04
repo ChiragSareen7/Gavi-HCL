@@ -11,10 +11,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field, ValidationError
 from starlette.requests import Request
 
 try:
@@ -572,6 +573,36 @@ def _send_callback(session_id: str, session: Dict[str, Any], reply: str) -> bool
 
 
 app = FastAPI()
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Better error messages for 422 validation errors."""
+    errors = []
+    for error in exc.errors():
+        field = " -> ".join(str(x) for x in error.get("loc", []))
+        msg = error.get("msg", "Validation error")
+        error_type = error.get("type", "unknown")
+        errors.append(f"{field}: {msg} (type: {error_type})")
+    
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "Validation error. Check your request format.",
+            "errors": errors,
+            "expected_format": {
+                "sessionId": "string (required)",
+                "message": {
+                    "sender": "string (required, e.g. 'scammer')",
+                    "text": "string (required, min 1 char, max 8000 chars)",
+                    "timestamp": "string (optional, e.g. '1770005528731')"
+                },
+                "conversationHistory": "array (optional)",
+                "metadata": "object (optional)"
+            }
+        }
+    )
+
 
 # Allow the Next.js dev server (localhost:3000) to call the API from the browser.
 app.add_middleware(
