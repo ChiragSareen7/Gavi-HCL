@@ -175,12 +175,26 @@ def main() -> None:
         )
 
     compute_dtype = dtype_from_name(cfg.bnb_4bit_compute_dtype)
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model_name_or_path,
-        quantization_config=quant_config,
-        device_map="auto",
-        torch_dtype=compute_dtype if not use_4bit else None,
-    )
+    
+    # On macOS, avoid device_map="auto" which can cause meta tensor issues
+    # Use explicit device instead
+    if sys.platform == "darwin":
+        # Use MPS if available, otherwise CPU
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.model_name_or_path,
+            quantization_config=quant_config,
+            torch_dtype=compute_dtype if not use_4bit else None,
+        )
+        model = model.to(device)
+    else:
+        # On Linux/GPU, use device_map="auto" for multi-GPU support
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.model_name_or_path,
+            quantization_config=quant_config,
+            device_map="auto",
+            torch_dtype=compute_dtype if not use_4bit else None,
+        )
 
     if use_4bit:
         model = prepare_model_for_kbit_training(model)
@@ -204,6 +218,12 @@ def main() -> None:
     eval_ds = to_text(eval_rows, tokenizer)
 
     # eval_strategy (4.46+); pin_memory=False on macOS (MPS doesn't support it)
+    # Determine device for training args
+    if sys.platform == "darwin":
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     training_args = TrainingArguments(
         output_dir=cfg.output_dir,
         num_train_epochs=cfg.num_train_epochs,
@@ -220,7 +240,7 @@ def main() -> None:
         save_strategy="steps",
         save_steps=cfg.save_steps,
         save_total_limit=cfg.save_total_limit,
-        bf16=torch.cuda.is_available(),
+        bf16=torch.cuda.is_available(),  # Only use bf16 on CUDA
         report_to="none",
         seed=cfg.seed,
         dataloader_pin_memory=(sys.platform != "darwin"),

@@ -1,7 +1,15 @@
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,10 +51,12 @@ def _load_prompt(name: str) -> str:
 
 
 # Honeypot: engagement persona only; NO defensive/safety replies.
-HONEYPOT_SYSTEM_PROMPT = _load_prompt("honeypot_system_prompt.txt") or (
+# Enhanced prompt that works like fine-tuned model
+HONEYPOT_SYSTEM_PROMPT = _load_prompt("enhanced_honeypot_prompt.txt") or _load_prompt("honeypot_system_prompt.txt") or (
     "You are Aman, a real Indian user. Output ONLY JSON: "
     '{"label":"SCAM|NOT_SCAM|UNCERTAIN","confidence":0-1,"reply":"<your message>"}. '
-    "Reply must be confused, curious, cooperative; never say contact bank or refuse. Extract details by asking (UPI again, link, bank)."
+    "Reply must be confused, curious, cooperative; never say contact bank or refuse. Extract details by asking (UPI again, link, bank). "
+    "Use full conversation history to maintain continuity. Reference previous messages naturally."
 )
 INTEL_EXTRACTION_PROMPT = _load_prompt("intel_extraction_prompt.txt") or (
     "Extract from conversation. Output ONLY JSON: "
@@ -109,30 +119,57 @@ def _client():
     return OpenAI(base_url=base_url, api_key=api_key)
 
 
-def _ft_client():
-    """Client for fine-tuned model: uses FT_BASE_URL if set, else same as Groq (base)."""
-    try:
-        from openai import OpenAI  # type: ignore
-    except Exception as e:
-        raise RuntimeError("Missing dependency `openai`. Install requirements.txt.") from e
+# FINE-TUNED MODEL CODE COMMENTED OUT - Using base model with enhanced prompt instead
+# def _ft_client():
+#     """Client for fine-tuned model: uses FT_BASE_URL if set, else same as Groq (base)."""
+#     try:
+#         from openai import OpenAI  # type: ignore
+#     except Exception as e:
+#         raise RuntimeError("Missing dependency `openai`. Install requirements.txt.") from e
+# 
+#     ft_base = os.environ.get("FT_BASE_URL", "").strip()
+#     if ft_base:
+#         api_key = os.environ.get("FT_API_KEY", "").strip() or "local"
+#         return OpenAI(base_url=ft_base.rstrip("/"), api_key=api_key)
+#     return _client()
 
-    ft_base = os.environ.get("FT_BASE_URL", "").strip()
-    if ft_base:
-        api_key = os.environ.get("FT_API_KEY", "").strip() or "local"
-        return OpenAI(base_url=ft_base.rstrip("/"), api_key=api_key)
+# Always use base client (Groq API)
+def _ft_client():
+    """Always returns base client - fine-tuned model disabled."""
     return _client()
 
 
-def _messages(text: str, context: Optional[str], system_prompt: Optional[str] = None) -> List[Dict[str, str]]:
+def _build_conversation_messages(
+    conversation_history: List[Dict[str, str]], 
+    current_message: str,
+    system_prompt: Optional[str] = None
+) -> List[Dict[str, str]]:
+    """
+    Build proper chat history with system/user/assistant roles for multi-turn conversations.
+    This ensures the model sees full conversation context and can continue naturally.
+    """
     prompt = system_prompt or CLASSIFIER_SYSTEM_PROMPT
-    if context:
-        user_content = f"(Context)\n{context}\n\n(Latest message)\n{text}"
-    else:
-        user_content = text
-    return [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": user_content},
-    ]
+    messages = [{"role": "system", "content": prompt}]
+    
+    # Add full conversation history with proper roles
+    for msg in conversation_history:
+        role = msg.get("role", "user")
+        content = msg.get("content", "").strip()
+        if not content:
+            continue
+        
+        # Map internal roles to OpenAI chat format
+        if role == "scammer":
+            messages.append({"role": "user", "content": content})
+        elif role == "agent":
+            messages.append({"role": "assistant", "content": content})
+        else:
+            messages.append({"role": role, "content": content})
+    
+    # Add current message
+    messages.append({"role": "user", "content": current_message})
+    
+    return messages
 
 
 def _parse_model_output(raw: str, strict: bool = True) -> ModelOutput:
@@ -172,24 +209,52 @@ def _parse_model_output(raw: str, strict: bool = True) -> ModelOutput:
     return ModelOutput(label=label, confidence=confidence, reply=reply, raw=raw)
 
 
-def _call_model(model: str, text: str, context: Optional[str], use_ft_client: bool = False) -> ModelOutput:
-    client = _ft_client() if use_ft_client else _client()
+def _call_model(
+    model: str, 
+    conversation_history: List[Dict[str, str]],
+    current_message: str,
+    use_ft_client: bool = False,  # Ignored now - always uses base model
+    max_tokens: int = 512,
+    system_prompt: Optional[str] = None,
+    use_rag: bool = True  # Enable RAG by default
+) -> ModelOutput:
+    """
+    Call base model with full conversation history, enhanced prompt, and RAG.
+    Fine-tuned model disabled - using enhanced prompt + RAG instead.
+    """
+    # Always use base client (fine-tuned model disabled)
+    client = _client()
+    
+    # Use RAG-enhanced messages if enabled
+    if use_rag:
+        messages = _build_rag_enhanced_messages(conversation_history, current_message, system_prompt)
+    else:
+        messages = _build_conversation_messages(conversation_history, current_message, system_prompt)
+    
     resp = client.chat.completions.create(
         model=model,
-        messages=_messages(text, context),
-        temperature=0.0,
-        max_tokens=256,
+        messages=messages,
+        temperature=0.3,  # Slight temperature for more natural responses
+        max_tokens=max_tokens,
+        stop=None,  # Let model decide when to stop naturally
     )
     raw = (resp.choices[0].message.content or "").strip()
-    return _parse_model_output(raw, strict=not use_ft_client)
+    
+    # Log for debugging
+    logger.debug(f"Model response (first 200 chars): {raw[:200]}")
+    
+    # Use strict=False for base model to handle parsing errors gracefully
+    return _parse_model_output(raw, strict=False)
 
 
 def _call_llm(system_prompt: str, user_content: str, use_ft_client: bool = True, max_tokens: int = 512) -> str:
     """Single LLM call with given system and user content. Returns raw content."""
-    model = os.environ.get("FT_MODEL", "").strip() or os.environ.get("BASE_MODEL", "").strip()
+    # Always use base model - fine-tuned model disabled
+    model = os.environ.get("BASE_MODEL", "").strip()
     if not model:
-        raise RuntimeError("Set FT_MODEL or BASE_MODEL.")
-    client = _ft_client() if use_ft_client else _client()
+        raise RuntimeError("Set BASE_MODEL env var.")
+    # Always use base client
+    client = _client()
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -224,6 +289,10 @@ def _get_session(session_id: str) -> Dict[str, Any]:
 
 
 def _conversation_context(messages: List[Dict[str, str]]) -> str:
+    """
+    Convert messages to readable text format for logging/debugging.
+    Note: This is NOT used for model input - we use _build_conversation_messages instead.
+    """
     if not messages:
         return ""
     lines = []
@@ -232,40 +301,231 @@ def _conversation_context(messages: List[Dict[str, str]]) -> str:
         content = (m.get("content") or "").strip()
         if role == "scammer":
             lines.append(f"Scammer: {content}")
-        else:
+        elif role == "agent":
             lines.append(f"Aman: {content}")
+        else:
+            lines.append(f"{role.capitalize()}: {content}")
     return "\n".join(lines)
 
 
-def _extract_intel_from_convo(convo_text: str) -> Dict[str, List[str]]:
-    """Use LLM to extract structured intel from full conversation."""
+# ========== RAG (Retrieval Augmented Generation) Implementation ==========
+# Simple in-memory knowledge base for scam patterns and responses
+_RAG_KNOWLEDGE_BASE = [
+    {
+        "pattern": "KYC pending account freeze",
+        "keywords": ["kyc", "pending", "freeze", "block", "account"],
+        "response_template": "Account freeze? I don't understand. Which company? My UPI is not working, bank details bhej do.",
+        "intel_to_extract": ["upi_ids", "links", "bank_accounts"],
+        "extraction_strategy": "Show confusion. Ask which company, mention UPI not working, request bank details. Keep it short."
+    },
+    {
+        "pattern": "lottery prize processing fee",
+        "keywords": ["lottery", "prize", "processing fee", "lakh", "crore", "won"],
+        "response_template": "Lottery? I don't remember entering. Which company? My UPI is not working, bank details bhej do.",
+        "intel_to_extract": ["upi_ids", "phone_numbers", "bank_accounts"],
+        "extraction_strategy": "Show confusion. Ask which company, mention UPI not working, request bank details. Keep it short."
+    },
+    {
+        "pattern": "parcel customs duty",
+        "keywords": ["parcel", "customs", "duty", "courier", "stuck"],
+        "response_template": "Parcel stuck? I need it. My UPI is not working, bank details bhej do. Tracking number bhi chahiye.",
+        "intel_to_extract": ["upi_ids", "bank_accounts", "phone_numbers"],
+        "extraction_strategy": "Show confusion. Mention UPI not working, ask for bank details and tracking. Keep it short and natural."
+    },
+    {
+        "pattern": "refund payment request",
+        "keywords": ["refund", "payment", "upi", "transfer", "money"],
+        "response_template": "Refund? I don't remember. Which company? My UPI is not working, bank details bhej do.",
+        "intel_to_extract": ["upi_ids", "bank_accounts", "ifsc_codes", "phone_numbers"],
+        "extraction_strategy": "Show confusion. Ask which company, mention UPI not working, request bank details. Keep it short."
+    },
+    {
+        "pattern": "electricity bill overdue",
+        "keywords": ["bill", "overdue", "electricity", "power", "last date"],
+        "response_template": "Bill overdue? Which company? My UPI is not working, bank details bhej do.",
+        "intel_to_extract": ["links", "upi_ids", "bank_accounts"],
+        "extraction_strategy": "Show confusion. Ask which company, mention UPI not working, request bank details. Keep it short."
+    },
+    {
+        "pattern": "IT support remote access",
+        "keywords": ["IT", "support", "license", "expired", "anydesk", "teamviewer"],
+        "response_template": "License expired? I don't understand. Which company? Where are you working from? Email aur phone bhej do.",
+        "intel_to_extract": ["phone_numbers", "emails", "bank_accounts"],
+        "extraction_strategy": "Show confusion. Ask which company and where they're from, request email and phone. Keep it short."
+    },
+    {
+        "pattern": "police cyber cell penalty",
+        "keywords": ["police", "cyber", "penalty", "case", "legal"],
+        "response_template": "Police case? I don't understand. Which station? My UPI is not working, bank details bhej do.",
+        "intel_to_extract": ["bank_accounts", "ifsc_codes", "phone_numbers"],
+        "extraction_strategy": "Show confusion. Ask which station, mention UPI not working, request bank details. Keep it short."
+    },
+    {
+        "pattern": "crypto investment",
+        "keywords": ["crypto", "investment", "guaranteed", "monthly", "deposit"],
+        "response_template": "Crypto investment? Which company? Where are you from? My UPI is not working, bank details bhej do.",
+        "intel_to_extract": ["links", "upi_ids", "bank_accounts", "phone_numbers"],
+        "extraction_strategy": "Show confusion. Ask which company and where they're from, mention UPI not working, request bank details. Keep it short."
+    }
+]
+
+
+def _rag_retrieve_context(message_text: str, conversation_history: List[Dict[str, str]]) -> str:
+    """
+    RAG: Retrieve relevant context from knowledge base based on message content.
+    Returns context string to enhance the prompt.
+    """
+    message_lower = message_text.lower()
+    context_parts = []
+    
+    # Find matching patterns
+    for kb_entry in _RAG_KNOWLEDGE_BASE:
+        keyword_matches = sum(1 for kw in kb_entry["keywords"] if kw in message_lower)
+        if keyword_matches >= 2:  # At least 2 keywords match
+            context_parts.append(f"Pattern: {kb_entry['pattern']}")
+            context_parts.append(f"Strategy: {kb_entry.get('extraction_strategy', kb_entry['response_template'])}")
+            context_parts.append(f"Suggested response: {kb_entry['response_template']}")
+            context_parts.append(f"Extract these details: {', '.join(kb_entry['intel_to_extract'])}")
+            context_parts.append(f"CRITICAL: Keep response SHORT (1 sentence max, sometimes 2). Sound CONFUSED and needing HELP. Don't be overly emotional. Mention UPI not working, ask for bank details. Ask which company/where they're from. Make it natural, not fake.")
+    
+    # Add conversation context if available
+    if conversation_history:
+        recent_messages = conversation_history[-4:]  # Last 4 messages
+        recent_context = _conversation_context(recent_messages)
+        if recent_context:
+            context_parts.append(f"Recent conversation:\n{recent_context}")
+    
+    return "\n".join(context_parts) if context_parts else ""
+
+
+def _build_rag_enhanced_messages(
+    conversation_history: List[Dict[str, str]], 
+    current_message: str,
+    system_prompt: Optional[str] = None
+) -> List[Dict[str, str]]:
+    """
+    Build messages with RAG context enhancement.
+    """
+    prompt = system_prompt or HONEYPOT_SYSTEM_PROMPT
+    
+    # Retrieve RAG context
+    rag_context = _rag_retrieve_context(current_message, conversation_history)
+    
+    messages = [{"role": "system", "content": prompt}]
+    
+    # Add RAG context if available
+    if rag_context:
+        messages.append({
+            "role": "user", 
+            "content": f"Context from knowledge base:\n{rag_context}\n\nUse this context to inform your response."
+        })
+        messages.append({
+            "role": "assistant",
+            "content": "Understood. I'll use this context to respond appropriately."
+        })
+    
+    # Add full conversation history
+    for msg in conversation_history:
+        role = msg.get("role", "user")
+        content = msg.get("content", "").strip()
+        if not content:
+            continue
+        
+        if role == "scammer":
+            messages.append({"role": "user", "content": content})
+        elif role == "agent":
+            messages.append({"role": "assistant", "content": content})
+        else:
+            messages.append({"role": role, "content": content})
+    
+    # Add current message
+    messages.append({"role": "user", "content": current_message})
+    
+    return messages
+
+
+def _extract_intel_from_convo(
+    conversation_history: List[Dict[str, str]], 
+    previous_intel: Optional[Dict[str, List[str]]] = None
+) -> Dict[str, List[str]]:
+    """
+    Incrementally extract intelligence from conversation.
+    Merges with previous extractions to avoid losing data.
+    """
+    if not conversation_history:
+        return previous_intel or {"upi_ids": [], "links": [], "bank_accounts": [], "phone_numbers": [], "tactics": []}
+    
+    # Convert to text for extraction prompt
+    convo_text = _conversation_context(conversation_history)
     if not convo_text.strip():
-        return {"upi_ids": [], "links": [], "bank_accounts": [], "phone_numbers": [], "tactics": []}
+        return previous_intel or {"upi_ids": [], "links": [], "bank_accounts": [], "phone_numbers": [], "tactics": []}
+    
     user_content = f"Conversation:\n{convo_text}\n\nExtract intelligence. Output ONLY the JSON object."
     raw = _call_llm(INTEL_EXTRACTION_PROMPT, user_content, use_ft_client=True, max_tokens=512)
+    
     try:
         parsed = json.loads(raw)
-        return {
+        new_intel = {
             "upi_ids": list(parsed.get("upi_ids", []) or []),
             "links": list(parsed.get("links", []) or []),
             "bank_accounts": list(parsed.get("bank_accounts", []) or []),
             "phone_numbers": list(parsed.get("phone_numbers", []) or []),
             "tactics": list(parsed.get("tactics", []) or []),
         }
-    except Exception:
-        return {"upi_ids": [], "links": [], "bank_accounts": [], "phone_numbers": [], "tactics": []}
+        
+        # Merge with previous intelligence (deduplicate)
+        if previous_intel:
+            for key in new_intel:
+                existing = set(previous_intel.get(key, []))
+                new_items = set(new_intel[key])
+                merged = list(existing | new_items)  # Union
+                new_intel[key] = merged
+        
+        return new_intel
+    except Exception as e:
+        logger.warning(f"Intel extraction failed: {e}, using previous intel")
+        return previous_intel or {"upi_ids": [], "links": [], "bank_accounts": [], "phone_numbers": [], "tactics": []}
 
 
 def _intel_count(intel: Dict[str, List[str]]) -> int:
     return sum(len(v) for v in intel.values() if isinstance(v, list))
 
 
-def _should_stop(session: Dict[str, Any], max_turns: int = 10, min_intel_items: int = 2) -> bool:
-    """Stop when enough intel collected or max turns reached."""
+def _should_stop(session: Dict[str, Any], max_turns: int = 100, min_intel_items: int = 20) -> bool:
+    """
+    Stop when enough intel collected or max turns reached.
+    Updated to allow continuous conversations for testing.
+    
+    Set AUTO_END_CONVERSATION=false in env to disable auto-ending entirely.
+    """
+    # Check if auto-ending is disabled (for testing/continuous conversations)
+    auto_end = os.environ.get("AUTO_END_CONVERSATION", "true").lower() not in ("false", "0", "no")
+    if not auto_end:
+        logger.debug("Auto-ending disabled - conversation continues indefinitely")
+        return False
+    
+    # Get configurable limits from env vars (for flexibility)
+    max_turns_env = os.environ.get("MAX_CONVERSATION_TURNS", "")
+    if max_turns_env:
+        try:
+            max_turns = int(max_turns_env)
+        except ValueError:
+            pass  # Use default
+    
+    min_intel_env = os.environ.get("MIN_INTEL_ITEMS", "")
+    if min_intel_env:
+        try:
+            min_intel_items = int(min_intel_env)
+        except ValueError:
+            pass  # Use default
+    
+    # Only stop if we've reached a very high threshold (allows continuous conversation)
     if session["turn_count"] >= max_turns:
+        logger.info(f"Stopping: max turns reached ({session['turn_count']} >= {max_turns})")
         return True
     count = _intel_count(session["extracted_intel"])
     if count >= min_intel_items:
+        logger.info(f"Stopping: enough intel extracted ({count} >= {min_intel_items})")
         return True
     return False
 
@@ -364,6 +624,24 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/debug/session/{session_id}")
+def get_session_debug(session_id: str) -> Dict[str, Any]:
+    """
+    Debug endpoint to get session data including extracted intelligence.
+    Useful for testing and demos.
+    """
+    session = _get_session(session_id)
+    
+    return {
+        "session_id": session_id,
+        "turn_count": session.get("turn_count", 0),
+        "scam_detected": session.get("scam_detected", False),
+        "extracted_intelligence": session.get("extracted_intel", {}),
+        "conversation_history": session.get("messages", []),
+        "intel_count": _intel_count(session.get("extracted_intel", {})),
+    }
+
+
 def _require_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")) -> None:
     """If HONEYPOT_API_KEY is set, require X-API-Key header to match. Otherwise allow (local dev)."""
     expected = os.environ.get("HONEYPOT_API_KEY", "").strip()
@@ -400,38 +678,148 @@ def v1_chat(
     Request: sessionId, message { sender, text, timestamp }, conversationHistory, metadata.
     Response: ONLY { "status": "success", "reply": "<agent reply>" }.
     When enough intel is extracted, we POST to hackathon callback URL (mandatory for scoring).
+    
+    FIXED: Now properly handles multi-turn conversations with full history.
     """
     _require_api_key(x_api_key)
     session_id = req.sessionId
     message_text = (req.message.text or "").strip()
     if not message_text:
         raise HTTPException(status_code=400, detail="message.text is required.")
+    
     session = _get_session(session_id)
+    
+    # Update session messages from platform's conversationHistory if provided
     if req.conversationHistory is not None:
-        session["messages"] = _normalize_history(req.conversationHistory)
-    context = _conversation_context(session["messages"])
+        normalized = _normalize_history(req.conversationHistory)
+        # Merge with existing session messages (platform may send partial history)
+        if normalized:
+            session["messages"] = normalized
+    
+    # Get current conversation history (without current message)
+    conversation_history = session["messages"].copy()
+    
+    # PHASE 1: Classification (if first message or not yet detected)
+    # Using base model with enhanced prompt + RAG
+    base_model = os.environ.get("BASE_MODEL", "").strip()
+    if not base_model:
+        raise HTTPException(status_code=500, detail="BASE_MODEL env var not set.")
+    
+    if not session["scam_detected"]:
+        try:
+            # Quick classification on first message (with RAG)
+            classify_out = _call_model(
+                base_model,
+                [],  # No history for first classification
+                message_text,
+                use_ft_client=False,  # Always use base model
+                max_tokens=256,
+                system_prompt=CLASSIFIER_SYSTEM_PROMPT,
+                use_rag=True,  # Enable RAG for classification
+            )
+            scam_detected = (classify_out.label == "SCAM") or (classify_out.label == "UNCERTAIN" and classify_out.confidence >= 0.5)
+            session["scam_detected"] = scam_detected
+            logger.info(f"Classification: {classify_out.label} (confidence: {classify_out.confidence})")
+        except Exception as e:
+            logger.warning(f"Classification failed: {e}, assuming uncertain")
+            session["scam_detected"] = False
+    
+    # PHASE 2: Agent Engagement (if scam detected, or continue conversation)
+    # Use full conversation history + RAG for natural multi-turn behavior
     try:
         out = _call_model(
-            os.environ.get("FT_MODEL", "").strip() or os.environ.get("BASE_MODEL", "").strip(),
-            message_text,
-            context or None,
-            use_ft_client=True,
+            base_model,  # Always use base model
+            conversation_history,  # Full history for context
+            message_text,  # Current message
+            use_ft_client=False,  # Always use base model
+            max_tokens=80,  # Keep responses very short (1 sentence, max 2) - like real texting
+            system_prompt=HONEYPOT_SYSTEM_PROMPT,
+            use_rag=True,  # Enable RAG for engagement
         )
+        logger.info(f"Model reply length: {len(out.reply)} chars")
     except Exception as e:
+        logger.error(f"LLM error: {type(e).__name__}: {str(e)}")
         raise HTTPException(
             status_code=503,
             detail=f"LLM error: {type(e).__name__}: {str(e)[:200]}",
         ) from e
-    scam_detected = (out.label == "SCAM") or (out.label == "UNCERTAIN" and out.confidence >= 0.5)
-    session["scam_detected"] = session["scam_detected"] or scam_detected
+    
+    # Update session with new messages
     session["messages"].append({"role": "scammer", "content": message_text})
     session["messages"].append({"role": "agent", "content": out.reply})
     session["turn_count"] = len([m for m in session["messages"] if m.get("role") == "agent"])
-    full_convo = _conversation_context(session["messages"])
-    session["extracted_intel"] = _extract_intel_from_convo(full_convo)
+    
+    # PHASE 3: Incremental Intelligence Extraction
+    # Extract from full conversation, merge with previous
+    session["extracted_intel"] = _extract_intel_from_convo(
+        session["messages"],
+        session.get("extracted_intel")
+    )
+    
+    # PHASE 4: Check if conversation should end
+    # Note: For testing, we allow longer conversations. Only stop if truly necessary.
     ended = _should_stop(session)
     if ended:
+        logger.info(f"Conversation ending. Intel items: {_intel_count(session['extracted_intel'])}, Turns: {session['turn_count']}")
         _send_callback(session_id, session, out.reply)
+    else:
+        # Log progress for debugging
+        logger.debug(f"Conversation continues. Intel: {_intel_count(session['extracted_intel'])}, Turns: {session['turn_count']}")
+    
     return HackathonResponse(status="success", reply=out.reply)
+
+
+class CompareRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=8000)
+
+
+class CompareResponse(BaseModel):
+    base: ModelOutput
+    finetuned: ModelOutput
+    decision_delta: str
+
+
+@app.post("/compare", response_model=CompareResponse)
+def compare(req: CompareRequest) -> CompareResponse:
+    """
+    Dev endpoint: compare base model vs fine-tuned model on the same text.
+    Returns both outputs and a decision_delta string (e.g., "same" or "NOT_SCAM -> SCAM").
+    """
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required.")
+
+    base_model = os.environ.get("BASE_MODEL", "").strip()
+    ft_model = os.environ.get("FT_MODEL", "").strip() or base_model
+
+    if not base_model:
+        raise HTTPException(status_code=500, detail="BASE_MODEL env var not set.")
+
+    # FINE-TUNED MODEL COMPARISON DISABLED - Compare base model with/without RAG instead
+    try:
+        base_out = _call_model(base_model, [], text, use_ft_client=False, use_rag=False)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Base model error: {type(e).__name__}: {str(e)[:200]}",
+        ) from e
+
+    try:
+        # Compare with RAG-enabled version
+        rag_out = _call_model(base_model, [], text, use_ft_client=False, use_rag=True)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"RAG model error: {type(e).__name__}: {str(e)[:200]}",
+        ) from e
+
+    # Compute decision_delta
+    if base_out.label == rag_out.label:
+        decision_delta = "same"
+    else:
+        decision_delta = f"{base_out.label} -> {rag_out.label}"
+
+    # Return base and RAG-enhanced (instead of fine-tuned)
+    return CompareResponse(base=base_out, finetuned=rag_out, decision_delta=decision_delta)
 
 

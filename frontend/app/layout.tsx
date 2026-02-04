@@ -1,8 +1,8 @@
 import React from "react";
 
 export const metadata = {
-  title: "Scam Compare",
-  description: "Compare base vs fine-tuned scam classifier outputs",
+  title: "Scammer Test Interface - AI Honeypot",
+  description: "Test the AI agent by acting as a scammer. Watch it extract intelligence.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
