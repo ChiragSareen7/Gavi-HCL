@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -11,12 +12,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, ValidationError
 from starlette.requests import Request
+
+# MongoDB imports
+try:
+    from motor.motor_asyncio import AsyncIOMotorClient
+    from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+    MONGO_AVAILABLE = True
+except ImportError:
+    MONGO_AVAILABLE = False
+    logger.warning("MongoDB libraries not installed. Install pymongo and motor for database storage.")
 
 try:
     # Loads .env from repo root (parent of backend/) for local dev.
@@ -39,9 +49,51 @@ Hackathon: Public REST API for Honeypot evaluation.
 - When we decide enough intel is extracted, we MUST POST to hackathon callback URL with the required payload.
 
 Env: GROQ_*, BASE_MODEL, FT_*, CALLBACK_URL (defaults to hackathon URL), HONEYPOT_API_KEY (x-api-key check).
+MongoDB: MONGODB_URI (optional, defaults to mongodb://localhost:27017), MONGODB_DB_NAME (defaults to honeypot_db).
 """
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# ========== MongoDB Connection ==========
+_mongo_client: Optional[Any] = None
+_mongo_db: Optional[Any] = None
+
+def _init_mongodb():
+    """Initialize MongoDB connection. Reads MONGODB_URI from .env file."""
+    global _mongo_client, _mongo_db
+    
+    if not MONGO_AVAILABLE:
+        logger.warning("MongoDB not available - using in-memory storage only")
+        return False
+    
+    # Read from environment (loaded from .env file by dotenv)
+    mongo_uri = os.environ.get("MONGODB_URI", "mongodb://localhost:27017").strip()
+    db_name = os.environ.get("MONGODB_DB_NAME", "honeypot_db").strip()
+    
+    # Log connection attempt (without exposing credentials)
+    if mongo_uri and mongo_uri != "mongodb://localhost:27017":
+        logger.info(f"Connecting to MongoDB: {db_name} (URI from .env)")
+    else:
+        logger.info(f"Using default MongoDB: {db_name} (localhost)")
+    
+    try:
+        _mongo_client = AsyncIOMotorClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        _mongo_db = _mongo_client[db_name]
+        # Test connection
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_mongo_client.admin.command('ping'))
+        logger.info(f"✅ MongoDB connected successfully: {db_name}")
+        return True
+    except (ConnectionFailure, ServerSelectionTimeoutError, Exception) as e:
+        logger.warning(f"MongoDB connection failed: {e}. Using in-memory storage only.")
+        _mongo_client = None
+        _mongo_db = None
+        return False
+
+# Initialize MongoDB on import
+_mongodb_available = _init_mongodb()
 
 
 def _load_prompt(name: str) -> str:
@@ -268,11 +320,59 @@ def _call_llm(system_prompt: str, user_content: str, use_ft_client: bool = True,
     return (resp.choices[0].message.content or "").strip()
 
 
-# ---------- Session store (in-memory; keyed by session_id) ----------
+# ---------- Session store (in-memory fallback; keyed by session_id) ----------
 _session_store: Dict[str, Dict[str, Any]] = {}
 
 
+async def _save_to_mongodb(collection: str, document: Dict[str, Any]) -> bool:
+    """Save document to MongoDB. Returns True if successful."""
+    if not _mongodb_available or not _mongo_db:
+        logger.debug(f"MongoDB not available, skipping save to {collection}")
+        return False
+    
+    try:
+        result = await _mongo_db[collection].insert_one(document)
+        if result.inserted_id:
+            logger.info(f"✅ MongoDB: Inserted into {collection}, _id: {result.inserted_id}")
+            return True
+        else:
+            logger.warning(f"⚠️ MongoDB: Insert returned no _id for {collection}")
+            return False
+    except Exception as e:
+        logger.error(f"❌ MongoDB save error to {collection}: {e}", exc_info=True)
+        return False
+
+
+async def _get_from_mongodb(collection: str, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Get document from MongoDB. Returns None if not found or error."""
+    if not _mongodb_available or not _mongo_db:
+        return None
+    
+    try:
+        result = await _mongo_db[collection].find_one(query)
+        if result and "_id" in result:
+            result["_id"] = str(result["_id"])  # Convert ObjectId to string
+        return result
+    except Exception as e:
+        logger.error(f"MongoDB get error: {e}")
+        return None
+
+
+async def _update_mongodb(collection: str, query: Dict[str, Any], update: Dict[str, Any]) -> bool:
+    """Update document in MongoDB. Returns True if successful."""
+    if not _mongodb_available or not _mongo_db:
+        return False
+    
+    try:
+        result = await _mongo_db[collection].update_one(query, {"$set": update})
+        return result.modified_count > 0
+    except Exception as e:
+        logger.error(f"MongoDB update error: {e}")
+        return False
+
+
 def _get_session(session_id: str) -> Dict[str, Any]:
+    """Get session from memory (MongoDB is async, so we use sync in-memory for now)."""
     if session_id not in _session_store:
         _session_store[session_id] = {
             "messages": [],
@@ -651,8 +751,26 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 
 
 @app.get("/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
+async def health() -> Dict[str, Any]:
+    """Health check endpoint with MongoDB status."""
+    mongo_status = "connected" if _mongodb_available else "not_available"
+    
+    # Test MongoDB connection
+    mongo_test = False
+    if _mongodb_available and _mongo_client:
+        try:
+            await _mongo_client.admin.command('ping')
+            mongo_test = True
+        except Exception as e:
+            logger.warning(f"MongoDB ping failed: {e}")
+    
+    return {
+        "status": "ok",
+        "mongodb": mongo_status,
+        "mongodb_available": _mongodb_available,
+        "mongodb_connected": mongo_test,
+        "database": _mongo_db.name if _mongo_db else None
+    }
 
 
 @app.get("/debug/session/{session_id}")
@@ -671,6 +789,79 @@ def get_session_debug(session_id: str) -> Dict[str, Any]:
         "conversation_history": session.get("messages", []),
         "intel_count": _intel_count(session.get("extracted_intel", {})),
     }
+
+
+@app.get("/debug/mongodb/stats")
+async def get_mongodb_stats() -> Dict[str, Any]:
+    """Debug endpoint to check MongoDB collections and counts."""
+    if not _mongodb_available or not _mongo_db:
+        return {
+            "mongodb_available": False,
+            "message": "MongoDB not connected"
+        }
+    
+    try:
+        collections = await _mongo_db.list_collection_names()
+        stats = {}
+        for coll_name in collections:
+            count = await _mongo_db[coll_name].count_documents({})
+            stats[coll_name] = count
+        
+        return {
+            "mongodb_available": True,
+            "database": _mongo_db.name,
+            "collections": stats,
+            "total_collections": len(collections)
+        }
+    except Exception as e:
+        return {
+            "mongodb_available": True,
+            "error": str(e)
+        }
+
+
+@app.get("/debug/mongodb/session/{session_id}")
+async def get_mongodb_session(session_id: str) -> Dict[str, Any]:
+    """Debug endpoint to get session data from MongoDB."""
+    if not _mongodb_available or not _mongo_db:
+        return {
+            "mongodb_available": False,
+            "message": "MongoDB not connected"
+        }
+    
+    try:
+        session = await _get_from_mongodb("sessions", {"session_id": session_id})
+        if not session:
+            return {
+                "found": False,
+                "session_id": session_id,
+                "message": "Session not found in MongoDB"
+            }
+        
+        # Get related data
+        requests = list(await _mongo_db["requests"].find({"session_id": session_id}).to_list(length=100))
+        responses = list(await _mongo_db["responses"].find({"session_id": session_id}).to_list(length=100))
+        messages = list(await _mongo_db["messages"].find({"session_id": session_id}).sort("timestamp", 1).to_list(length=100))
+        
+        # Convert ObjectIds to strings
+        for doc in requests + responses + messages:
+            if "_id" in doc:
+                doc["_id"] = str(doc["_id"])
+        
+        return {
+            "found": True,
+            "session": session,
+            "requests_count": len(requests),
+            "responses_count": len(responses),
+            "messages_count": len(messages),
+            "requests": requests[:5],  # First 5
+            "responses": responses[:5],
+            "messages": messages[:10]
+        }
+    except Exception as e:
+        return {
+            "error": str(e)
+        }
 
 
 def _require_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")) -> None:
@@ -700,8 +891,9 @@ def _normalize_history(entries: Optional[List[ConversationHistoryEntry]]) -> Lis
 
 
 @app.post("/v1/chat", response_model=HackathonResponse)
-def v1_chat(
+async def v1_chat(
     req: HackathonRequest,
+    background_tasks: BackgroundTasks,
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ) -> HackathonResponse:
     """
@@ -711,12 +903,43 @@ def v1_chat(
     When enough intel is extracted, we POST to hackathon callback URL (mandatory for scoring).
     
     FIXED: Now properly handles multi-turn conversations with full history.
+    All data is stored in MongoDB for persistence.
     """
     _require_api_key(x_api_key)
     session_id = req.sessionId
     message_text = (req.message.text or "").strip()
     if not message_text:
         raise HTTPException(status_code=400, detail="message.text is required.")
+    
+    # Store incoming request to MongoDB (background task)
+    request_doc = {
+        "session_id": session_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "request": {
+            "sessionId": req.sessionId,
+            "message": {
+                "sender": req.message.sender,
+                "text": req.message.text,
+                "timestamp": req.message.timestamp,
+            },
+            "conversationHistory": [dict(h) for h in (req.conversationHistory or [])],
+            "metadata": req.metadata or {},
+        },
+        "api_key_provided": x_api_key is not None,
+    }
+    
+    # Store request to MongoDB (with logging)
+    async def save_request():
+        try:
+            result = await _save_to_mongodb("requests", request_doc)
+            if result:
+                logger.info(f"✅ MongoDB: Saved request for session {session_id}")
+            else:
+                logger.warning(f"⚠️ MongoDB: Failed to save request for session {session_id} (MongoDB not available)")
+        except Exception as e:
+            logger.error(f"❌ MongoDB request save error: {e}", exc_info=True)
+    
+    background_tasks.add_task(save_request)
     
     session = _get_session(session_id)
     
@@ -787,12 +1010,147 @@ def v1_chat(
         session.get("extracted_intel")
     )
     
+    # Store response and conversation data to MongoDB (background tasks)
+    response_doc = {
+        "session_id": session_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "response": {
+            "status": "success",
+            "reply": out.reply,
+        },
+        "model_output": {
+            "label": out.label,
+            "confidence": out.confidence,
+        },
+        "session_state": {
+            "turn_count": session["turn_count"],
+            "scam_detected": session["scam_detected"],
+            "extracted_intel": session["extracted_intel"],
+        },
+    }
+    # Store response to MongoDB
+    async def save_response():
+        try:
+            result = await _save_to_mongodb("responses", response_doc)
+            if result:
+                logger.info(f"✅ MongoDB: Saved response for session {session_id}")
+            else:
+                logger.warning(f"⚠️ MongoDB: Failed to save response for session {session_id}")
+        except Exception as e:
+            logger.error(f"❌ MongoDB response save error: {e}", exc_info=True)
+    
+    background_tasks.add_task(save_response)
+    
+    # Store full conversation messages
+    message_doc = {
+        "session_id": session_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "message": {
+            "role": "scammer",
+            "content": message_text,
+            "sender": req.message.sender,
+            "original_timestamp": req.message.timestamp,
+        },
+    }
+    
+    async def save_scammer_message():
+        try:
+            result = await _save_to_mongodb("messages", message_doc)
+            if result:
+                logger.info(f"✅ MongoDB: Saved scammer message for session {session_id}")
+            else:
+                logger.warning(f"⚠️ MongoDB: Failed to save scammer message for session {session_id}")
+        except Exception as e:
+            logger.error(f"❌ MongoDB message save error: {e}", exc_info=True)
+    
+    background_tasks.add_task(save_scammer_message)
+    
+    agent_message_doc = {
+        "session_id": session_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "message": {
+            "role": "agent",
+            "content": out.reply,
+        },
+        "model_info": {
+            "label": out.label,
+            "confidence": out.confidence,
+        },
+    }
+    
+    async def save_agent_message():
+        try:
+            result = await _save_to_mongodb("messages", agent_message_doc)
+            if result:
+                logger.info(f"✅ MongoDB: Saved agent message for session {session_id}")
+            else:
+                logger.warning(f"⚠️ MongoDB: Failed to save agent message for session {session_id}")
+        except Exception as e:
+            logger.error(f"❌ MongoDB agent message save error: {e}", exc_info=True)
+    
+    background_tasks.add_task(save_agent_message)
+    
+    # Store/update session in MongoDB
+    session_doc = {
+        "session_id": session_id,
+        "updated_at": datetime.utcnow().isoformat(),
+        "turn_count": session["turn_count"],
+        "scam_detected": session["scam_detected"],
+        "extracted_intel": session["extracted_intel"],
+        "conversation_history": session["messages"],
+        "metadata": req.metadata or {},
+    }
+    
+    async def update_session():
+        try:
+            existing = await _get_from_mongodb("sessions", {"session_id": session_id})
+            if existing:
+                result = await _update_mongodb("sessions", {"session_id": session_id}, session_doc)
+                if result:
+                    logger.info(f"✅ MongoDB: Updated session {session_id}")
+                else:
+                    logger.warning(f"⚠️ MongoDB: Failed to update session {session_id}")
+            else:
+                session_doc["created_at"] = datetime.utcnow().isoformat()
+                result = await _save_to_mongodb("sessions", session_doc)
+                if result:
+                    logger.info(f"✅ MongoDB: Created new session {session_id}")
+                else:
+                    logger.warning(f"⚠️ MongoDB: Failed to create session {session_id}")
+        except Exception as e:
+            logger.error(f"❌ MongoDB session update error: {e}", exc_info=True)
+    
+    background_tasks.add_task(update_session)
+    
     # PHASE 4: Check if conversation should end
     # Note: For testing, we allow longer conversations. Only stop if truly necessary.
     ended = _should_stop(session)
     if ended:
         logger.info(f"Conversation ending. Intel items: {_intel_count(session['extracted_intel'])}, Turns: {session['turn_count']}")
         _send_callback(session_id, session, out.reply)
+        
+        # Store conversation end event
+        end_doc = {
+            "session_id": session_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "event": "conversation_ended",
+            "final_state": {
+                "turn_count": session["turn_count"],
+                "extracted_intel": session["extracted_intel"],
+                "intel_count": _intel_count(session["extracted_intel"]),
+            },
+        }
+        async def save_end_event():
+            try:
+                result = await _save_to_mongodb("events", end_doc)
+                if result:
+                    logger.info(f"✅ MongoDB: Saved conversation end event for session {session_id}")
+                else:
+                    logger.warning(f"⚠️ MongoDB: Failed to save end event for session {session_id}")
+            except Exception as e:
+                logger.error(f"❌ MongoDB event save error: {e}", exc_info=True)
+        
+        background_tasks.add_task(save_end_event)
     else:
         # Log progress for debugging
         logger.debug(f"Conversation continues. Intel: {_intel_count(session['extracted_intel'])}, Turns: {session['turn_count']}")
