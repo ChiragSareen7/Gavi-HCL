@@ -287,7 +287,8 @@ def _call_model(
     use_ft_client: bool = False,  # Ignored now - always uses base model
     max_tokens: int = 512,
     system_prompt: Optional[str] = None,
-    use_rag: bool = True  # Enable RAG by default
+    use_rag: bool = True,  # Enable RAG by default
+    extracted_intel: Optional[Dict[str, List[str]]] = None,
 ) -> ModelOutput:
     """
     Call base model with full conversation history, enhanced prompt, and RAG.
@@ -298,7 +299,9 @@ def _call_model(
     
     # Use RAG-enhanced messages if enabled
     if use_rag:
-        messages = _build_rag_enhanced_messages(conversation_history, current_message, system_prompt)
+        messages = _build_rag_enhanced_messages(
+            conversation_history, current_message, system_prompt, extracted_intel
+        )
     else:
         messages = _build_conversation_messages(conversation_history, current_message, system_prompt)
     
@@ -497,15 +500,17 @@ def _merge_intel(base: Optional[Dict[str, List[str]]], extra: Dict[str, List[str
 
 
 def _stop_condition_met(intel: Dict[str, List[str]]) -> bool:
+    """Stop if ANY of the primary extraction targets have been captured."""
     if intel.get("upi_ids"):
+        return True
+    if intel.get("bank_accounts") and intel.get("ifsc_codes"):
         return True
     if intel.get("phone_numbers"):
         return True
-    if intel.get("links"):
-        return True
     if intel.get("emails"):
         return True
-    if intel.get("bank_accounts") and intel.get("ifsc_codes"):
+    # Name — check both bank_names and any explicit names extracted
+    if intel.get("bank_names"):
         return True
     return False
 
@@ -514,92 +519,98 @@ def _agent_turns(messages: List[Dict[str, str]]) -> int:
     return len([m for m in messages if m.get("role") == "agent"])
 
 
-def _needs_clarification(reply: str) -> bool:
-    text = _normalize_text(reply)
-    return any(term in text for term in DETAILS_REQUEST_TERMS)
-
 
 # ========== RAG (Retrieval Augmented Generation) Implementation ==========
-# Strategy-only knowledge base — NO response templates to avoid verbatim copying
+# Abstract strategy per scam type — NO example phrases, only extraction goals
 _RAG_KNOWLEDGE_BASE = [
     {
         "pattern": "KYC pending account freeze",
         "keywords": ["kyc", "pending", "freeze", "block", "account"],
-        "intel_to_extract": ["upi_ids", "links", "bank_accounts"],
-        "question_angles": ["Which bank/company is this about?", "When did this happen?", "Ask for reference number or case ID", "Which branch?", "Who authorized this?"],
+        "intel_targets": ["bank_accounts", "ifsc_codes", "names", "upi_ids", "emails"],
     },
     {
         "pattern": "lottery prize processing fee",
         "keywords": ["lottery", "prize", "processing fee", "lakh", "crore", "won"],
-        "intel_to_extract": ["upi_ids", "phone_numbers", "bank_accounts"],
-        "question_angles": ["Which lottery/company?", "When did I enter?", "Ask for ticket/reference number", "Where is the office?", "Who is the organizer?"],
+        "intel_targets": ["upi_ids", "phone_numbers", "bank_accounts", "names", "emails"],
     },
     {
         "pattern": "parcel customs duty",
         "keywords": ["parcel", "customs", "duty", "courier", "stuck"],
-        "intel_to_extract": ["upi_ids", "bank_accounts", "phone_numbers"],
-        "question_angles": ["Tracking number?", "Which courier company?", "Where is it stuck?", "Who sent the parcel?", "When was it shipped?"],
+        "intel_targets": ["upi_ids", "bank_accounts", "phone_numbers", "emails"],
     },
     {
         "pattern": "refund payment request",
         "keywords": ["refund", "payment", "upi", "transfer", "money"],
-        "intel_to_extract": ["upi_ids", "bank_accounts", "ifsc_codes", "phone_numbers"],
-        "question_angles": ["Refund for what?", "Which order/transaction?", "Which company?", "Ask for order ID", "When was the payment made?"],
+        "intel_targets": ["upi_ids", "bank_accounts", "ifsc_codes", "phone_numbers", "emails"],
     },
     {
         "pattern": "electricity bill overdue",
         "keywords": ["bill", "overdue", "electricity", "power", "last date"],
-        "intel_to_extract": ["links", "upi_ids", "bank_accounts"],
-        "question_angles": ["Which electricity board?", "Consumer number?", "Due date?", "Which area/zone?", "Can I pay at the office?"],
+        "intel_targets": ["links", "upi_ids", "bank_accounts", "phone_numbers"],
     },
     {
         "pattern": "IT support remote access",
         "keywords": ["IT", "support", "license", "expired", "anydesk", "teamviewer"],
-        "intel_to_extract": ["phone_numbers", "emails", "bank_accounts"],
-        "question_angles": ["Which company?", "Employee ID?", "Email for ticket?", "Which department?", "Manager's name?"],
+        "intel_targets": ["phone_numbers", "emails", "bank_accounts", "names"],
     },
     {
         "pattern": "police cyber cell penalty",
         "keywords": ["police", "cyber", "penalty", "case", "legal"],
-        "intel_to_extract": ["bank_accounts", "ifsc_codes", "phone_numbers"],
-        "question_angles": ["Which police station?", "FIR number?", "Officer name?", "Case number?", "Which court?"],
+        "intel_targets": ["bank_accounts", "ifsc_codes", "phone_numbers", "names"],
     },
     {
         "pattern": "crypto investment",
         "keywords": ["crypto", "investment", "guaranteed", "monthly", "deposit"],
-        "intel_to_extract": ["links", "upi_ids", "bank_accounts", "phone_numbers"],
-        "question_angles": ["Which platform?", "Company registration number?", "Where is the office?", "Who is the founder?", "SEBI registered?"],
+        "intel_targets": ["links", "upi_ids", "bank_accounts", "phone_numbers"],
     },
 ]
 
 
-def _rag_retrieve_context(message_text: str, conversation_history: List[Dict[str, str]]) -> str:
+def _rag_retrieve_context(
+    message_text: str, 
+    conversation_history: List[Dict[str, str]],
+    extracted_intel: Optional[Dict[str, List[str]]] = None,
+) -> str:
     """
-    RAG: Retrieve relevant context from knowledge base based on message content.
-    Returns strategy guidance (NO response templates) to enhance the prompt.
+    RAG: Build minimal situational guidance — what intel is missing, what to avoid repeating.
+    Contains NO example phrases or scripts. The LLM generates all wording on its own.
     """
     message_lower = message_text.lower()
     context_parts = []
     
-    # Find matching patterns — provide STRATEGY, never a verbatim response
+    # 1. Identify scam pattern (just the type, no tactics or phrases)
     for kb_entry in _RAG_KNOWLEDGE_BASE:
         keyword_matches = sum(1 for kw in kb_entry["keywords"] if kw in message_lower)
-        if keyword_matches >= 2:  # At least 2 keywords match
-            # Pick 2-3 random question angles so the LLM gets variety each time
-            angles = kb_entry.get("question_angles", [])
-            selected_angles = random.sample(angles, min(3, len(angles)))
-            context_parts.append(f"Detected scam pattern: {kb_entry['pattern']}")
-            context_parts.append(f"Try to extract: {', '.join(kb_entry['intel_to_extract'])}")
-            context_parts.append(f"Question angles to consider (pick 2-3, rephrase in your own words): {'; '.join(selected_angles)}")
+        if keyword_matches >= 2:
+            context_parts.append(f"Likely scam type: {kb_entry['pattern']}")
+            break  # Only match one pattern
     
-    # Inject anti-repetition context: show the agent its own previous replies
+    # 2. Tell the LLM what's already extracted vs still missing
+    if extracted_intel:
+        got = []
+        missing = []
+        for key, label in [
+            ("upi_ids", "UPI ID"), ("bank_accounts", "Bank account"), 
+            ("ifsc_codes", "IFSC"), ("phone_numbers", "Phone number"),
+            ("emails", "Email"), ("bank_names", "Name"),
+        ]:
+            if extracted_intel.get(key):
+                got.append(label)
+            else:
+                missing.append(label)
+        if got:
+            context_parts.append(f"Already obtained: {', '.join(got)}")
+        if missing:
+            context_parts.append(f"Still needed: {', '.join(missing)}")
+            context_parts.append("Try to naturally obtain ONE of the missing items this turn.")
+    
+    # 3. Anti-repetition: show recent agent replies so the LLM avoids them
     agent_replies = [m.get("content", "") for m in conversation_history if m.get("role") == "agent"]
     if agent_replies:
-        last_replies = agent_replies[-3:]  # Last 3 agent replies
-        context_parts.append("YOUR PREVIOUS REPLIES (DO NOT repeat any phrase from these):")
+        last_replies = agent_replies[-3:]
+        context_parts.append("Your recent replies (do not repeat any wording or structure from these):")
         for i, reply in enumerate(last_replies, 1):
-            context_parts.append(f"  Reply {i}: \"{reply}\"")
-        context_parts.append("Generate a COMPLETELY different reply. Different words, different sentence structure, different opening word.")
+            context_parts.append(f"  [{i}] \"{reply}\"")
     
     return "\n".join(context_parts) if context_parts else ""
 
@@ -607,15 +618,16 @@ def _rag_retrieve_context(message_text: str, conversation_history: List[Dict[str
 def _build_rag_enhanced_messages(
     conversation_history: List[Dict[str, str]], 
     current_message: str,
-    system_prompt: Optional[str] = None
+    system_prompt: Optional[str] = None,
+    extracted_intel: Optional[Dict[str, List[str]]] = None,
 ) -> List[Dict[str, str]]:
     """
-    Build messages with RAG context enhancement and anti-repetition injection.
+    Build messages with RAG context enhancement, extraction awareness, and anti-repetition.
     """
     prompt = system_prompt or HONEYPOT_SYSTEM_PROMPT
     
-    # Retrieve RAG context (includes anti-repetition context now)
-    rag_context = _rag_retrieve_context(current_message, conversation_history)
+    # Retrieve RAG context (includes extraction guidance + anti-repetition)
+    rag_context = _rag_retrieve_context(current_message, conversation_history, extracted_intel)
     
     # Build system prompt with RAG context appended directly (no fake assistant ack)
     full_system = prompt
@@ -784,33 +796,15 @@ SCAM_RAG_KB = [
     },
 ]
 
+# Minimal closing replies — used ONLY when stop condition is met (code path, not LLM).
+# Kept deliberately short and generic so they don't pollute LLM behavior.
 NEUTRAL_CLOSE_REPLIES = [
-    "Achha theek hai, main apne end se check karta hoon.",
-    "Ek minute, kuch verify karna hai mujhe.",
-    "Ruko, main dekh raha hoon apne phone pe.",
-    "Haan okay, mujhe thoda time do check karne ko.",
-    "Main abhi busy hoon thoda, baad mein dekhta hoon.",
-    "Okay let me see, I need to check something first.",
-    "Hold on, mera net slow hai abhi. Ek sec.",
-    "Theek hai, main apna statement check karke batata hoon.",
+    "Okay, I will try from my side.",
+    "Got it, let me try this.",
+    "Okay, will do it now.",
+    "Alright, trying it.",
+    "Okay done, will attempt this.",
 ]
-
-CURIOSITY_QUESTIONS = [
-    "Aap kaunsi company se bol rahe ho? Mujhe koi message nahi aaya tha.",
-    "Kaun bol raha hai ye? Kaunsi bank se hai ye?",
-    "Mujhe samajh nahi aaya, exactly kya hua hai mere account mein?",
-    "Ye kab hua? Mujhe toh koi notification nahi mila.",
-    "Par aapko mera number kaise mila? Kaunsa department hai ye?",
-    "Wait wait, kaunsa account? Mere paas do-teen accounts hai.",
-    "Arre par pehle ye batao aap kaun ho? Employee ID kya hai?",
-    "Ye SMS ya email aaya tha kya mujhe? Maine toh kuch nahi dekha.",
-    "Konsi branch se call aa rahi hai? City bhi bata do.",
-    "Abhi abhi aaya ye ya purana matter hai? Timeline kya hai?",
-    "Kya RBI se order hai ye? Official letter bheja hai kya?",
-    "Par mera UPI toh kaam hi nahi kar raha, kaise karoon?",
-]
-
-DETAILS_REQUEST_TERMS = ["upi", "account number", "bank details", "ifsc", "transfer", "send money"]
 
 
 def _normalize_text(text: str) -> str:
@@ -1567,9 +1561,10 @@ async def v1_chat(
             conversation_history,  # Full history for context
             message_text,  # Current message
             use_ft_client=False,  # Always use base model
-            max_tokens=160,  # Enough for 2-3 short sentences with questions
+            max_tokens=150,  # Enough for 1-2 short sentences with natural excuse
             system_prompt=HONEYPOT_SYSTEM_PROMPT,
             use_rag=True,  # Enable RAG for engagement
+            extracted_intel=session.get("extracted_intel"),  # So LLM targets missing intel
         )
         logger.info(f"Model reply length: {len(out.reply)} chars")
     except Exception as e:
@@ -1579,16 +1574,6 @@ async def v1_chat(
             detail=f"LLM error: {type(e).__name__}: {str(e)[:200]}",
         ) from e
     
-    # If early turn and model jumps to asking for bank/UPI too fast, replace with
-    # a curiosity question — but pick one that hasn't been used in this session yet.
-    agent_turn_count = _agent_turns(session["messages"])
-    if agent_turn_count < 2 and _needs_clarification(out.reply):
-        used_replies = {m.get("content", "") for m in session["messages"] if m.get("role") == "agent"}
-        available = [q for q in CURIOSITY_QUESTIONS if q not in used_replies]
-        if not available:
-            available = CURIOSITY_QUESTIONS  # Fallback if all used (shouldn't happen with 12 options)
-        out.reply = random.choice(available)
-
     # Update session with new messages
     session["messages"].append({"role": "scammer", "content": message_text})
     session["messages"].append({"role": "agent", "content": out.reply})
