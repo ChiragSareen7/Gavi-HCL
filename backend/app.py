@@ -308,7 +308,7 @@ def _call_model(
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
-        temperature=0.7,  # Higher temperature for varied, human-like replies
+        temperature=0.8,  # Higher temperature for varied, natural questions and human-like replies
         max_tokens=max_tokens,
         stop=None,  # Let model decide when to stop naturally
     )
@@ -521,47 +521,103 @@ def _agent_turns(messages: List[Dict[str, str]]) -> int:
 
 
 # ========== RAG (Retrieval Augmented Generation) Implementation ==========
-# Abstract strategy per scam type — NO example phrases, only extraction goals
+# Strategy per scam type with question guidance
 _RAG_KNOWLEDGE_BASE = [
     {
         "pattern": "KYC pending account freeze",
-        "keywords": ["kyc", "pending", "freeze", "block", "account"],
-        "intel_targets": ["bank_accounts", "ifsc_codes", "names", "upi_ids", "emails"],
+        "keywords": ["kyc", "pending", "freeze", "block", "account", "compromised", "locked", "otp"],
+        "intel_targets": ["bank_accounts", "ifsc_codes", "names", "upi_ids", "emails", "phone_numbers"],
+        "question_types": [
+            "Ask which bank/company this is from",
+            "Ask why account is blocked and how to fix it",
+            "Mention UPI not working, ask for bank account and IFSC",
+            "Ask if there's another way to verify",
+            "Ask for their contact number to discuss",
+        ],
     },
     {
         "pattern": "lottery prize processing fee",
         "keywords": ["lottery", "prize", "processing fee", "lakh", "crore", "won"],
         "intel_targets": ["upi_ids", "phone_numbers", "bank_accounts", "names", "emails"],
+        "question_types": [
+            "Ask which company/lottery this is",
+            "Ask how you won and when",
+            "Mention UPI not working, ask for alternative payment method",
+            "Ask which account should receive the money",
+            "Ask for their UPI ID or bank details",
+        ],
     },
     {
         "pattern": "parcel customs duty",
         "keywords": ["parcel", "customs", "duty", "courier", "stuck"],
         "intel_targets": ["upi_ids", "bank_accounts", "phone_numbers", "emails"],
+        "question_types": [
+            "Ask which courier company",
+            "Ask for tracking number",
+            "Mention UPI not working, ask for bank transfer details",
+            "Ask which account to pay to",
+            "Ask for their contact number",
+        ],
     },
     {
         "pattern": "refund payment request",
         "keywords": ["refund", "payment", "upi", "transfer", "money"],
         "intel_targets": ["upi_ids", "bank_accounts", "ifsc_codes", "phone_numbers", "emails"],
+        "question_types": [
+            "Ask which company/order this refund is for",
+            "Mention UPI not working, ask for bank account and IFSC",
+            "Ask which account should receive the refund",
+            "Ask for their UPI ID or bank details",
+            "Ask if there's another payment method",
+        ],
     },
     {
         "pattern": "electricity bill overdue",
         "keywords": ["bill", "overdue", "electricity", "power", "last date"],
         "intel_targets": ["links", "upi_ids", "bank_accounts", "phone_numbers"],
+        "question_types": [
+            "Ask which electricity company",
+            "Mention UPI not working, ask for bank account details",
+            "Ask which account number to pay to",
+            "Ask for their contact number",
+            "Ask if there's another way to pay",
+        ],
     },
     {
         "pattern": "IT support remote access",
         "keywords": ["IT", "support", "license", "expired", "anydesk", "teamviewer"],
         "intel_targets": ["phone_numbers", "emails", "bank_accounts", "names"],
+        "question_types": [
+            "Ask which company they're from",
+            "Ask what exactly happened to the license",
+            "Ask for their phone number to discuss",
+            "Ask for their email to send details",
+            "Ask if there's another way to fix this",
+        ],
     },
     {
         "pattern": "police cyber cell penalty",
         "keywords": ["police", "cyber", "penalty", "case", "legal"],
         "intel_targets": ["bank_accounts", "ifsc_codes", "phone_numbers", "names"],
+        "question_types": [
+            "Ask which police station",
+            "Ask what the case is about",
+            "Mention UPI not working, ask for bank account and IFSC",
+            "Ask which account to pay to",
+            "Ask for their contact number",
+        ],
     },
     {
         "pattern": "crypto investment",
         "keywords": ["crypto", "investment", "guaranteed", "monthly", "deposit"],
         "intel_targets": ["links", "upi_ids", "bank_accounts", "phone_numbers"],
+        "question_types": [
+            "Ask which company/platform",
+            "Ask how this investment works",
+            "Mention UPI not working, ask for bank account details",
+            "Ask which account to transfer money to",
+            "Ask for their UPI ID or contact",
+        ],
     },
 ]
 
@@ -572,45 +628,73 @@ def _rag_retrieve_context(
     extracted_intel: Optional[Dict[str, List[str]]] = None,
 ) -> str:
     """
-    RAG: Build minimal situational guidance — what intel is missing, what to avoid repeating.
-    Contains NO example phrases or scripts. The LLM generates all wording on its own.
+    RAG: Build situational guidance — what intel is missing, what questions to ask, what to avoid repeating.
     """
     message_lower = message_text.lower()
     context_parts = []
     
-    # 1. Identify scam pattern (just the type, no tactics or phrases)
+    # 1. Identify scam pattern and get question guidance
+    matched_pattern = None
     for kb_entry in _RAG_KNOWLEDGE_BASE:
         keyword_matches = sum(1 for kw in kb_entry["keywords"] if kw in message_lower)
         if keyword_matches >= 2:
+            matched_pattern = kb_entry
             context_parts.append(f"Likely scam type: {kb_entry['pattern']}")
+            # Add question guidance
+            if "question_types" in kb_entry:
+                context_parts.append("Suggested question approaches (use ONE, reword naturally):")
+                for q_type in kb_entry["question_types"][:3]:  # Show top 3
+                    context_parts.append(f"  - {q_type}")
             break  # Only match one pattern
     
     # 2. Tell the LLM what's already extracted vs still missing
     if extracted_intel:
         got = []
         missing = []
+        missing_details = []
         for key, label in [
             ("upi_ids", "UPI ID"), ("bank_accounts", "Bank account"), 
             ("ifsc_codes", "IFSC"), ("phone_numbers", "Phone number"),
             ("emails", "Email"), ("bank_names", "Name"),
         ]:
-            if extracted_intel.get(key):
+            if extracted_intel.get(key) and len(extracted_intel.get(key, [])) > 0:
                 got.append(label)
             else:
                 missing.append(label)
+                missing_details.append(key)
         if got:
             context_parts.append(f"Already obtained: {', '.join(got)}")
         if missing:
             context_parts.append(f"Still needed: {', '.join(missing)}")
-            context_parts.append("Try to naturally obtain ONE of the missing items this turn.")
+            # Prioritize what to ask for based on pattern
+            if matched_pattern and "intel_targets" in matched_pattern:
+                priority = [d for d in missing_details if d in matched_pattern["intel_targets"]]
+                if priority:
+                    priority_label = {
+                        "upi_ids": "UPI ID",
+                        "bank_accounts": "Bank account",
+                        "ifsc_codes": "IFSC code",
+                        "phone_numbers": "Phone number",
+                        "emails": "Email",
+                    }.get(priority[0], priority[0])
+                    context_parts.append(f"PRIORITY: Ask for {priority_label} this turn. Use questions like: 'My UPI is not working, can you share your bank account and IFSC?' or 'Which account should I use?' or 'Can you share your UPI ID?'")
+            else:
+                context_parts.append("Ask a question to naturally obtain ONE of the missing items this turn.")
     
     # 3. Anti-repetition: show recent agent replies so the LLM avoids them
     agent_replies = [m.get("content", "") for m in conversation_history if m.get("role") == "agent"]
     if agent_replies:
         last_replies = agent_replies[-3:]
-        context_parts.append("Your recent replies (do not repeat any wording or structure from these):")
+        context_parts.append("Your recent replies (do not repeat any wording, structure, or question type from these):")
         for i, reply in enumerate(last_replies, 1):
             context_parts.append(f"  [{i}] \"{reply}\"")
+        # Check if recent replies lack questions
+        has_questions = any("?" in reply for reply in last_replies)
+        if not has_questions:
+            context_parts.append("⚠️ CRITICAL: Your recent replies had no questions. You MUST ask a question in this reply.")
+    
+    # 4. General guidance
+    context_parts.append("REMEMBER: Every reply MUST include at least ONE question. Never just say 'Okay', 'Done', 'Will try' without asking something.")
     
     return "\n".join(context_parts) if context_parts else ""
 
@@ -1561,11 +1645,15 @@ async def v1_chat(
             conversation_history,  # Full history for context
             message_text,  # Current message
             use_ft_client=False,  # Always use base model
-            max_tokens=150,  # Enough for 1-2 short sentences with natural excuse
+            max_tokens=200,  # Enough for 1-2 short sentences with questions
             system_prompt=HONEYPOT_SYSTEM_PROMPT,
             use_rag=True,  # Enable RAG for engagement
             extracted_intel=session.get("extracted_intel"),  # So LLM targets missing intel
         )
+        
+        # Validate that reply contains a question (log warning if not, but don't block)
+        if "?" not in out.reply and len(out.reply.strip()) > 0:
+            logger.warning(f"Agent reply missing question mark: '{out.reply[:50]}...'")
         logger.info(f"Model reply length: {len(out.reply)} chars")
     except Exception as e:
         logger.error(f"LLM error: {type(e).__name__}: {str(e)}")
