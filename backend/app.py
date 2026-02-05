@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -509,6 +510,15 @@ def _stop_condition_met(intel: Dict[str, List[str]]) -> bool:
     return False
 
 
+def _agent_turns(messages: List[Dict[str, str]]) -> int:
+    return len([m for m in messages if m.get("role") == "agent"])
+
+
+def _needs_clarification(reply: str) -> bool:
+    text = _normalize_text(reply)
+    return any(term in text for term in DETAILS_REQUEST_TERMS)
+
+
 # ========== RAG (Retrieval Augmented Generation) Implementation ==========
 # Simple in-memory knowledge base for scam patterns and responses
 _RAG_KNOWLEDGE_BASE = [
@@ -785,6 +795,22 @@ SCAM_RAG_KB = [
     },
 ]
 
+NEUTRAL_CLOSE_REPLIES = [
+    "I will check and get back to you.",
+    "Let me verify this once.",
+    "Give me a moment, I am checking.",
+    "Okay, I will confirm and reply.",
+]
+
+CURIOSITY_QUESTIONS = [
+    "Why is OTP required?",
+    "Which branch is this from?",
+    "What exactly happened to my account?",
+    "Who asked you to contact me about this?",
+]
+
+DETAILS_REQUEST_TERMS = ["upi", "account number", "bank details", "ifsc", "transfer", "send money"]
+
 
 def _normalize_text(text: str) -> str:
     return (text or "").lower().strip()
@@ -992,8 +1018,8 @@ def _agent_notes(session: Dict[str, Any]) -> str:
     return "; ".join(parts) if parts else "Conversation ended."
 
 
-def _send_callback(session_id: str, session: Dict[str, Any], reply: str) -> Tuple[bool, Dict[str, Any]]:
-    """POST to hackathon callback URL with exact payload format. Returns (ok, payload)."""
+def _send_callback(session_id: str, session: Dict[str, Any], reply: str) -> Tuple[bool, Dict[str, Any], Optional[int], Optional[str]]:
+    """POST to hackathon callback URL with exact payload format. Returns (ok, payload, status, error)."""
     url = (os.environ.get("CALLBACK_URL", "").strip() or HACKATHON_CALLBACK_URL)
     intel = session.get("extracted_intel", {}) or {}
     suspicious = list(set((intel.get("tactics", []) or []) + (intel.get("suspicious_keywords", []) or [])))
@@ -1012,13 +1038,29 @@ def _send_callback(session_id: str, session: Dict[str, Any], reply: str) -> Tupl
     }
     try:
         import urllib.request
+        import urllib.error
+        headers = {"Content-Type": "application/json"}
+        callback_key = (
+            os.environ.get("CALLBACK_API_KEY", "").strip()
+            or os.environ.get("HONEYPOT_API_KEY", "").strip()
+            or os.environ.get("X-API-Key", "").strip()
+        )
+        if callback_key:
+            headers["x-api-key"] = callback_key
         payload = json.dumps(payload_obj).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, method="POST", headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
         with urllib.request.urlopen(req, timeout=15) as r:
-            return (200 <= r.status < 300), payload_obj
+            return (200 <= r.status < 300), payload_obj, r.status, None
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            body = None
+        logger.warning(f"Callback POST failed: HTTP {e.code} {e.reason} body={body}")
+        return False, payload_obj, e.code, body
     except Exception as e:
         logger.warning(f"Callback POST failed: {e}")
-        return False, payload_obj
+        return False, payload_obj, None, str(e)
 
 
 @asynccontextmanager
@@ -1394,7 +1436,7 @@ async def v1_chat(
         session["turn_count"] = len(session["messages"])
         session["extracted_intel"] = _extract_intel_from_convo(session["messages"], pre_intel)
 
-        neutral_reply = os.environ.get("NEUTRAL_CLOSE_REPLY", "Okay, I will check and get back to you.")
+        neutral_reply = random.choice(NEUTRAL_CLOSE_REPLIES)
 
         response_doc = {
             "session_id": session_id,
@@ -1485,7 +1527,7 @@ async def v1_chat(
         background_tasks.add_task(update_session_stop)
 
         # Final callback + store payload
-        callback_ok, callback_payload = _send_callback(session_id, session, neutral_reply)
+        callback_ok, callback_payload, callback_status, callback_error = _send_callback(session_id, session, neutral_reply)
         if callback_ok:
             session["callback_sent"] = True
             logger.info(f"✅ Callback sent for session {session_id}")
@@ -1497,6 +1539,8 @@ async def v1_chat(
             "timestamp": datetime.utcnow().isoformat(),
             "callback_url": os.environ.get("CALLBACK_URL", "").strip() or HACKATHON_CALLBACK_URL,
             "ok": callback_ok,
+            "status": callback_status,
+            "error": callback_error,
             "payload": callback_payload,
         }
 
@@ -1530,6 +1574,10 @@ async def v1_chat(
             detail=f"LLM error: {type(e).__name__}: {str(e)[:200]}",
         ) from e
     
+    # If early turn and model jumps to asking for bank/UPI, replace with curiosity question.
+    if _agent_turns(session["messages"]) < 1 and _needs_clarification(out.reply):
+        out.reply = random.choice(CURIOSITY_QUESTIONS)
+
     # Update session with new messages
     session["messages"].append({"role": "scammer", "content": message_text})
     session["messages"].append({"role": "agent", "content": out.reply})
@@ -1663,7 +1711,7 @@ async def v1_chat(
     ended = _should_stop(session)
     if ended and session.get("scam_detected", False) and not session.get("callback_sent", False):
         logger.info(f"Conversation ending. Intel items: {_intel_count(session['extracted_intel'])}, Turns: {session['turn_count']}")
-        callback_ok, callback_payload = _send_callback(session_id, session, out.reply)
+        callback_ok, callback_payload, callback_status, callback_error = _send_callback(session_id, session, out.reply)
         if callback_ok:
             session["callback_sent"] = True
             logger.info(f"✅ Callback sent for session {session_id}")
@@ -1676,6 +1724,8 @@ async def v1_chat(
             "timestamp": datetime.utcnow().isoformat(),
             "callback_url": os.environ.get("CALLBACK_URL", "").strip() or HACKATHON_CALLBACK_URL,
             "ok": callback_ok,
+            "status": callback_status,
+            "error": callback_error,
             "payload": callback_payload,
         }
 
