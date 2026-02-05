@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 # Configure logging
 logging.basicConfig(
@@ -127,10 +127,11 @@ class ModelOutput(BaseModel):
 
 
 # ---------- Hackathon contract: request/response ----------
+# Hackathon docs: timestamp is "Epoch time format in ms" (number); we accept number or string.
 class IncomingMessage(BaseModel):
     sender: str = Field(..., description="e.g. scammer")
     text: str = Field(..., min_length=1, max_length=8000)
-    timestamp: Optional[str] = Field(None, description="ISO time")
+    timestamp: Optional[Union[int, float, str]] = Field(None, description="Epoch time in ms (number or string)")
 
 
 class ConversationHistoryEntry(BaseModel):
@@ -139,7 +140,7 @@ class ConversationHistoryEntry(BaseModel):
     text: Optional[str] = None
     role: Optional[str] = None
     content: Optional[str] = None
-    timestamp: Optional[str] = None
+    timestamp: Optional[Union[int, float, str]] = None
 
 
 class HackathonRequest(BaseModel):
@@ -695,7 +696,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
                 "message": {
                     "sender": "string (required, e.g. 'scammer')",
                     "text": "string (required, min 1 char, max 8000 chars)",
-                    "timestamp": "string (optional, e.g. '1770005528731')"
+                    "timestamp": "number or string (optional, epoch ms e.g. 1770005528731)"
                 },
                 "conversationHistory": "array (optional)",
                 "metadata": "object (optional)"
