@@ -16,7 +16,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.requests import Request
 
 # MongoDB imports
@@ -127,11 +127,27 @@ class ModelOutput(BaseModel):
 
 
 # ---------- Hackathon contract: request/response ----------
-# Hackathon docs: timestamp is "Epoch time format in ms" (number); we accept number or string.
+# Hackathon docs: timestamp is "Epoch time format in ms" (number or string); we accept both.
+def _coerce_timestamp_to_str(v: Any) -> Optional[str]:
+    """Accept epoch ms as number or string; normalize to str for schema compatibility."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return str(int(v))
+    if isinstance(v, str):
+        return v
+    return None
+
+
 class IncomingMessage(BaseModel):
     sender: str = Field(..., description="e.g. scammer")
     text: str = Field(..., min_length=1, max_length=8000)
-    timestamp: Optional[Union[int, float, str]] = Field(None, description="Epoch time in ms (number or string)")
+    timestamp: Optional[str] = Field(None, description="Epoch time in ms (number or string)")
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def timestamp_accept_number_or_string(cls, v: Any) -> Optional[str]:
+        return _coerce_timestamp_to_str(v)
 
 
 class ConversationHistoryEntry(BaseModel):
@@ -140,7 +156,12 @@ class ConversationHistoryEntry(BaseModel):
     text: Optional[str] = None
     role: Optional[str] = None
     content: Optional[str] = None
-    timestamp: Optional[Union[int, float, str]] = None
+    timestamp: Optional[str] = None
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def timestamp_accept_number_or_string(cls, v: Any) -> Optional[str]:
+        return _coerce_timestamp_to_str(v)
 
 
 class HackathonRequest(BaseModel):
@@ -696,7 +717,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
                 "message": {
                     "sender": "string (required, e.g. 'scammer')",
                     "text": "string (required, min 1 char, max 8000 chars)",
-                    "timestamp": "number or string (optional, epoch ms e.g. 1770005528731)"
+                    "timestamp": "number or string (optional, epoch ms e.g. 1770005528731 or \"1770005528731\")"
                 },
                 "conversationHistory": "array (optional)",
                 "metadata": "object (optional)"
