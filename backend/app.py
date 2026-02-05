@@ -4,7 +4,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Configure logging
 logging.basicConfig(
@@ -170,9 +170,10 @@ class HackathonRequest(BaseModel):
 
 
 class HackathonResponse(BaseModel):
-    """Exact contract: only status and reply."""
+    """Exact contract: status/reply, plus scamDetected for scam gating."""
     status: str = Field(..., description="Must be 'success'")
-    reply: str = Field(..., description="Human-like reply from agent")
+    reply: str = Field(..., description="Human-like reply from agent (empty if NOT_SCAM)")
+    scamDetected: bool = Field(..., description="True when scam intent confirmed")
 
 
 def _client():
@@ -394,11 +395,17 @@ def _get_session(session_id: str) -> Dict[str, Any]:
             "messages": [],
             "turn_count": 0,
             "scam_detected": False,
+            "callback_sent": False,
             "extracted_intel": {
                 "upi_ids": [],
                 "links": [],
                 "bank_accounts": [],
+                "ifsc_codes": [],
+                "bank_names": [],
+                "branch_names": [],
                 "phone_numbers": [],
+                "emails": [],
+                "suspicious_keywords": [],
                 "tactics": [],
             },
         }
@@ -423,6 +430,83 @@ def _conversation_context(messages: List[Dict[str, str]]) -> str:
         else:
             lines.append(f"{role.capitalize()}: {content}")
     return "\n".join(lines)
+
+
+BANK_NAME_KEYWORDS = [
+    "sbi",
+    "state bank",
+    "hdfc",
+    "icici",
+    "axis",
+    "kotak",
+    "pnb",
+    "punjab national",
+    "bank of baroda",
+    "canara",
+    "union bank",
+    "idfc",
+    "yes bank",
+    "indusind",
+    "bank of india",
+    "central bank",
+    "uco",
+    "federal bank",
+]
+
+
+def _regex_extract_intel(text: str) -> Dict[str, List[str]]:
+    import re
+
+    lowered = (text or "").lower()
+    upi_ids = re.findall(r"\b[\w.-]{2,}@[\w.-]{2,}\b", text)
+    links = re.findall(r"(https?://\S+|www\.\S+)", text)
+    phones = re.findall(r"\b(?:\+?\d{1,3}[-\s]?)?\d{10}\b", text)
+    accounts = re.findall(r"\b\d{9,18}\b", text)
+    emails = re.findall(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", text, flags=re.IGNORECASE)
+    ifsc = re.findall(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", text)
+    branch = re.findall(r"\bbranch[:\-]?\s*([A-Za-z ]{2,30})\b", text, flags=re.IGNORECASE)
+
+    bank_names = []
+    for name in BANK_NAME_KEYWORDS:
+        if name in lowered:
+            bank_names.append(name)
+
+    return {
+        "upi_ids": list(set(upi_ids)),
+        "links": list(set([l[0] if isinstance(l, tuple) else l for l in links])),
+        "bank_accounts": list(set(accounts)),
+        "ifsc_codes": list(set([c.upper() for c in ifsc])),
+        "bank_names": list(set(bank_names)),
+        "branch_names": list(set([b.strip() for b in branch if b.strip()])),
+        "phone_numbers": list(set(phones)),
+        "emails": list(set(emails)),
+        "suspicious_keywords": list(set(_keyword_hits(lowered))),
+        "tactics": [],
+    }
+
+
+def _merge_intel(base: Optional[Dict[str, List[str]]], extra: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    merged: Dict[str, List[str]] = {}
+    if base:
+        for key, values in base.items():
+            merged[key] = list(values or [])
+    for key, values in extra.items():
+        merged[key] = list(set(merged.get(key, [])) | set(values or []))
+    return merged
+
+
+def _stop_condition_met(intel: Dict[str, List[str]]) -> bool:
+    if intel.get("upi_ids"):
+        return True
+    if intel.get("phone_numbers"):
+        return True
+    if intel.get("links"):
+        return True
+    if intel.get("emails"):
+        return True
+    if intel.get("bank_accounts") and intel.get("ifsc_codes"):
+        return True
+    return False
 
 
 # ========== RAG (Retrieval Augmented Generation) Implementation ==========
@@ -570,12 +654,34 @@ def _extract_intel_from_convo(
     Merges with previous extractions to avoid losing data.
     """
     if not conversation_history:
-        return previous_intel or {"upi_ids": [], "links": [], "bank_accounts": [], "phone_numbers": [], "tactics": []}
+        return previous_intel or {
+            "upi_ids": [],
+            "links": [],
+            "bank_accounts": [],
+            "ifsc_codes": [],
+            "bank_names": [],
+            "branch_names": [],
+            "phone_numbers": [],
+            "emails": [],
+            "suspicious_keywords": [],
+            "tactics": [],
+        }
     
     # Convert to text for extraction prompt
     convo_text = _conversation_context(conversation_history)
     if not convo_text.strip():
-        return previous_intel or {"upi_ids": [], "links": [], "bank_accounts": [], "phone_numbers": [], "tactics": []}
+        return previous_intel or {
+            "upi_ids": [],
+            "links": [],
+            "bank_accounts": [],
+            "ifsc_codes": [],
+            "bank_names": [],
+            "branch_names": [],
+            "phone_numbers": [],
+            "emails": [],
+            "suspicious_keywords": [],
+            "tactics": [],
+        }
     
     user_content = f"Conversation:\n{convo_text}\n\nExtract intelligence. Output ONLY the JSON object."
     raw = _call_llm(INTEL_EXTRACTION_PROMPT, user_content, use_ft_client=True, max_tokens=512)
@@ -586,9 +692,19 @@ def _extract_intel_from_convo(
             "upi_ids": list(parsed.get("upi_ids", []) or []),
             "links": list(parsed.get("links", []) or []),
             "bank_accounts": list(parsed.get("bank_accounts", []) or []),
+            "ifsc_codes": list(parsed.get("ifsc_codes", []) or []),
+            "bank_names": list(parsed.get("bank_names", []) or []),
+            "branch_names": list(parsed.get("branch_names", []) or []),
             "phone_numbers": list(parsed.get("phone_numbers", []) or []),
+            "emails": list(parsed.get("emails", []) or []),
+            "suspicious_keywords": list(parsed.get("suspicious_keywords", []) or []),
             "tactics": list(parsed.get("tactics", []) or []),
         }
+
+        # Merge regex-based extraction for deterministic fields
+        regex_intel = _regex_extract_intel(convo_text)
+        for key, values in regex_intel.items():
+            new_intel[key] = list(set(new_intel.get(key, [])) | set(values))
         
         # Merge with previous intelligence (deduplicate)
         if previous_intel:
@@ -601,12 +717,200 @@ def _extract_intel_from_convo(
         return new_intel
     except Exception as e:
         logger.warning(f"Intel extraction failed: {e}, using previous intel")
-        return previous_intel or {"upi_ids": [], "links": [], "bank_accounts": [], "phone_numbers": [], "tactics": []}
+        return previous_intel or {
+            "upi_ids": [],
+            "links": [],
+            "bank_accounts": [],
+            "ifsc_codes": [],
+            "bank_names": [],
+            "branch_names": [],
+            "phone_numbers": [],
+            "emails": [],
+            "suspicious_keywords": [],
+            "tactics": [],
+        }
 
 
 def _intel_count(intel: Dict[str, List[str]]) -> int:
     return sum(len(v) for v in intel.values() if isinstance(v, list))
 
+
+SCAM_KEYWORDS = [
+    "account blocked",
+    "account freeze",
+    "kyc pending",
+    "urgent",
+    "verify now",
+    "send money",
+    "refund",
+    "upi id",
+    "click link",
+    "payment failed",
+    "prize",
+    "courier parcel",
+    "electricity bill",
+    "otp",
+    "bank account",
+    "suspension",
+    "blocked today",
+    "verify immediately",
+    "limited time",
+    "refund pending",
+]
+
+AUTHORITY_TERMS = ["bank", "kyc", "upi", "government", "rbi", "police", "courier", "electricity"]
+URGENCY_TERMS = ["urgent", "immediately", "now", "today", "within", "suspended", "blocked", "freeze"]
+MONEY_TERMS = ["send money", "pay", "payment", "transfer", "refund", "charge", "fee", "deposit"]
+
+SCAM_RAG_KB = [
+    {
+        "name": "account_threats",
+        "phrases": ["account blocked", "account freeze", "kyc pending", "verify immediately", "account suspended"],
+    },
+    {
+        "name": "otp_harvest",
+        "phrases": ["share otp", "otp", "verification code", "code sent"],
+    },
+    {
+        "name": "payment_traps",
+        "phrases": ["send money", "small amount", "processing fee", "activation fee", "refund pending"],
+    },
+    {
+        "name": "link_phishing",
+        "phrases": ["click link", "open link", "verify now", "update details", "login here"],
+    },
+    {
+        "name": "reward_lure",
+        "phrases": ["prize", "lottery", "reward", "cashback", "winner"],
+    },
+]
+
+
+def _normalize_text(text: str) -> str:
+    return (text or "").lower().strip()
+
+
+def _keyword_hits(text: str) -> List[str]:
+    hits = []
+    for kw in SCAM_KEYWORDS:
+        if kw in text:
+            hits.append(kw)
+    return hits
+
+
+def _pattern_hits(text: str) -> Dict[str, List[str]]:
+    import re
+
+    hits: Dict[str, List[str]] = {"upi_ids": [], "links": [], "phones": [], "accounts": []}
+    upi = re.findall(r"\b[\w.-]{2,}@[\w.-]{2,}\b", text)
+    links = re.findall(r"(https?://\S+|www\.\S+)", text)
+    phones = re.findall(r"\b(?:\+?\d{1,3}[-\s]?)?\d{10}\b", text)
+    accounts = re.findall(r"\b\d{9,18}\b", text)
+
+    if upi:
+        hits["upi_ids"].extend(upi)
+    if links:
+        hits["links"].extend([l[0] if isinstance(l, tuple) else l for l in links])
+    if phones:
+        hits["phones"].extend(phones)
+    if accounts:
+        hits["accounts"].extend(accounts)
+    return hits
+
+
+def _rag_hits(text: str) -> List[str]:
+    hits = []
+    for entry in SCAM_RAG_KB:
+        for phrase in entry["phrases"]:
+            if phrase in text:
+                hits.append(entry["name"])
+                break
+    return hits
+
+
+def _detect_scam(message_text: str, conversation_history: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Return detection result and signals for logging."""
+    text = _normalize_text(message_text)
+    history_text = " ".join(_normalize_text(m.get("content", "")) for m in conversation_history)
+    combined = f"{text} {history_text}".strip()
+
+    keyword_hits = _keyword_hits(combined)
+    rag_hits = _rag_hits(combined)
+    patterns = _pattern_hits(combined)
+
+    has_link = len(patterns["links"]) > 0
+    has_upi = len(patterns["upi_ids"]) > 0
+    has_phone = len(patterns["phones"]) > 0
+    has_account = len(patterns["accounts"]) > 0
+
+    urgency = any(t in combined for t in URGENCY_TERMS)
+    authority = any(t in combined for t in AUTHORITY_TERMS)
+    money = any(t in combined for t in MONEY_TERMS)
+
+    score = 0
+    score += min(len(keyword_hits), 5)
+    score += len(rag_hits)
+    score += 2 if has_link else 0
+    score += 2 if has_upi else 0
+    score += 1 if has_phone else 0
+    score += 1 if has_account else 0
+    score += 1 if (urgency and authority) else 0
+    score += 1 if money else 0
+
+    strong = has_link or has_upi or (urgency and money) or (authority and urgency)
+
+    threshold = int(os.environ.get("SCAM_SCORE_THRESHOLD", "4"))
+    low_threshold = int(os.environ.get("SCAM_SCORE_LOW", "1"))
+
+    result = {
+        "score": score,
+        "strong": strong,
+        "keyword_hits": keyword_hits,
+        "rag_hits": rag_hits,
+        "patterns": patterns,
+        "urgency": urgency,
+        "authority": authority,
+        "money": money,
+    }
+
+    # High confidence rules
+    if strong and (score >= low_threshold):
+        result["scam"] = True
+        result["reason"] = "strong_signal"
+        return result
+    if score >= threshold:
+        result["scam"] = True
+        result["reason"] = "score_threshold"
+        return result
+    if score <= low_threshold and not strong:
+        result["scam"] = False
+        result["reason"] = "low_score"
+        return result
+
+    # LLM fallback when uncertain
+    try:
+        base_model = os.environ.get("BASE_MODEL", "").strip()
+        if base_model:
+            llm_out = _call_model(
+                base_model,
+                conversation_history,
+                message_text,
+                use_ft_client=False,
+                max_tokens=128,
+                system_prompt=CLASSIFIER_SYSTEM_PROMPT,
+                use_rag=True,
+            )
+            result["llm_label"] = llm_out.label
+            result["llm_confidence"] = llm_out.confidence
+            result["scam"] = llm_out.label == "SCAM" or (llm_out.label == "UNCERTAIN" and llm_out.confidence >= 0.6)
+            result["reason"] = "llm_fallback"
+            return result
+    except Exception as e:
+        logger.warning(f"LLM fallback failed: {e}")
+
+    result["scam"] = False
+    result["reason"] = "fallback_default"
+    return result
 
 def _should_stop(session: Dict[str, Any], max_turns: int = 100, min_intel_items: int = 20) -> bool:
     """
@@ -619,6 +923,10 @@ def _should_stop(session: Dict[str, Any], max_turns: int = 100, min_intel_items:
     auto_end = os.environ.get("AUTO_END_CONVERSATION", "true").lower() not in ("false", "0", "no")
     if not auto_end:
         logger.debug("Auto-ending disabled - conversation continues indefinitely")
+        return False
+
+    # Only end after scam intent is confirmed.
+    if not session.get("scam_detected", False):
         return False
     
     # Get configurable limits from env vars (for flexibility)
@@ -636,6 +944,11 @@ def _should_stop(session: Dict[str, Any], max_turns: int = 100, min_intel_items:
         except ValueError:
             pass  # Use default
     
+    # Stop if core intelligence is already present.
+    if _stop_condition_met(session.get("extracted_intel", {})):
+        logger.info("Stopping: core intelligence already extracted")
+        return True
+
     # Only stop if we've reached a very high threshold (allows continuous conversation)
     if session["turn_count"] >= max_turns:
         logger.info(f"Stopping: max turns reached ({session['turn_count']} >= {max_turns})")
@@ -655,16 +968,35 @@ def _agent_notes(session: Dict[str, Any]) -> str:
     """Short summary of scam behavior for callback agentNotes."""
     intel = session.get("extracted_intel", {})
     parts = []
-    for k, v in (intel or {}).items():
-        if v and isinstance(v, list):
-            parts.append(f"{k}: {', '.join(str(x) for x in v[:5])}")
+    tactics = intel.get("tactics", []) or []
+    suspicious = intel.get("suspicious_keywords", []) or []
+    if tactics:
+        parts.append(f"tactics: {', '.join(tactics[:4])}")
+    if suspicious and not tactics:
+        parts.append(f"signals: {', '.join(suspicious[:4])}")
+
+    intel_bits = []
+    if intel.get("upi_ids"):
+        intel_bits.append("UPI")
+    if intel.get("bank_accounts") and intel.get("ifsc_codes"):
+        intel_bits.append("bank+IFSC")
+    if intel.get("phone_numbers"):
+        intel_bits.append("phone")
+    if intel.get("links"):
+        intel_bits.append("link")
+    if intel.get("emails"):
+        intel_bits.append("email")
+    if intel_bits:
+        parts.append(f"intel: {', '.join(intel_bits)}")
+
     return "; ".join(parts) if parts else "Conversation ended."
 
 
-def _send_callback(session_id: str, session: Dict[str, Any], reply: str) -> bool:
-    """POST to hackathon callback URL with exact payload format. Returns True if sent."""
+def _send_callback(session_id: str, session: Dict[str, Any], reply: str) -> Tuple[bool, Dict[str, Any]]:
+    """POST to hackathon callback URL with exact payload format. Returns (ok, payload)."""
     url = (os.environ.get("CALLBACK_URL", "").strip() or HACKATHON_CALLBACK_URL)
     intel = session.get("extracted_intel", {}) or {}
+    suspicious = list(set((intel.get("tactics", []) or []) + (intel.get("suspicious_keywords", []) or [])))
     payload_obj = {
         "sessionId": session_id,
         "scamDetected": session.get("scam_detected", False),
@@ -674,7 +1006,7 @@ def _send_callback(session_id: str, session: Dict[str, Any], reply: str) -> bool
             "upiIds": list(intel.get("upi_ids", []) or []),
             "phishingLinks": list(intel.get("links", []) or []),
             "phoneNumbers": list(intel.get("phone_numbers", []) or []),
-            "suspiciousKeywords": list(intel.get("tactics", []) or []),
+            "suspiciousKeywords": suspicious,
         },
         "agentNotes": _agent_notes(session),
     }
@@ -683,9 +1015,10 @@ def _send_callback(session_id: str, session: Dict[str, Any], reply: str) -> bool
         payload = json.dumps(payload_obj).encode("utf-8")
         req = urllib.request.Request(url, data=payload, method="POST", headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=15) as r:
-            return 200 <= r.status < 300
-    except Exception:
-        return False
+            return (200 <= r.status < 300), payload_obj
+    except Exception as e:
+        logger.warning(f"Callback POST failed: {e}")
+        return False, payload_obj
 
 
 @asynccontextmanager
@@ -980,30 +1313,202 @@ async def v1_chat(
     # Get current conversation history (without current message)
     conversation_history = session["messages"].copy()
     
-    # PHASE 1: Classification (if first message or not yet detected)
-    # Using base model with enhanced prompt + RAG
+    # PHASE 1: Scam detection (keyword + pattern + RAG + optional LLM fallback)
     base_model = os.environ.get("BASE_MODEL", "").strip()
     if not base_model:
         raise HTTPException(status_code=500, detail="BASE_MODEL env var not set.")
     
+    detection = _detect_scam(message_text, conversation_history)
+    session["scam_detected"] = bool(detection.get("scam", False))
+    logger.info(
+        "Scam detection result: scam=%s score=%s reason=%s keywords=%s rag=%s",
+        session["scam_detected"],
+        detection.get("score"),
+        detection.get("reason"),
+        len(detection.get("keyword_hits", [])),
+        len(detection.get("rag_hits", [])),
+    )
+
+    # If NOT_SCAM: return immediately with empty reply and scamDetected=false
     if not session["scam_detected"]:
-        try:
-            # Quick classification on first message (with RAG)
-            classify_out = _call_model(
-                base_model,
-                [],  # No history for first classification
-                message_text,
-                use_ft_client=False,  # Always use base model
-                max_tokens=256,
-                system_prompt=CLASSIFIER_SYSTEM_PROMPT,
-                use_rag=True,  # Enable RAG for classification
-            )
-            scam_detected = (classify_out.label == "SCAM") or (classify_out.label == "UNCERTAIN" and classify_out.confidence >= 0.5)
-            session["scam_detected"] = scam_detected
-            logger.info(f"Classification: {classify_out.label} (confidence: {classify_out.confidence})")
-        except Exception as e:
-            logger.warning(f"Classification failed: {e}, assuming uncertain")
-            session["scam_detected"] = False
+        response_doc = {
+            "session_id": session_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "response": {
+                "status": "success",
+                "reply": "",
+                "scamDetected": False,
+            },
+            "agentNotes": "",
+            "session_state": {
+                "turn_count": session["turn_count"],
+                "scam_detected": False,
+                "extracted_intel": session["extracted_intel"],
+            },
+        }
+
+        async def save_response_not_scam():
+            try:
+                result = await _save_to_mongodb("responses", response_doc)
+                if result:
+                    logger.info(f"✅ MongoDB: Saved NOT_SCAM response for session {session_id}")
+                else:
+                    logger.warning(f"⚠️ MongoDB: Failed to save NOT_SCAM response for session {session_id}")
+            except Exception as e:
+                logger.error(f"❌ MongoDB NOT_SCAM response save error: {e}", exc_info=True)
+
+        background_tasks.add_task(save_response_not_scam)
+
+        # Store/update session state (no agent activation)
+        session_doc = {
+            "session_id": session_id,
+            "updated_at": datetime.utcnow().isoformat(),
+            "turn_count": session["turn_count"],
+            "scam_detected": False,
+            "callback_sent": session.get("callback_sent", False),
+            "agent_notes": "",
+            "extracted_intel": session["extracted_intel"],
+            "conversation_history": session["messages"],
+            "metadata": req.metadata or {},
+        }
+
+        async def update_session_not_scam():
+            try:
+                existing = await _get_from_mongodb("sessions", {"session_id": session_id})
+                if existing:
+                    await _update_mongodb("sessions", {"session_id": session_id}, session_doc)
+                else:
+                    session_doc["created_at"] = datetime.utcnow().isoformat()
+                    await _save_to_mongodb("sessions", session_doc)
+            except Exception as e:
+                logger.error(f"❌ MongoDB NOT_SCAM session update error: {e}", exc_info=True)
+
+        background_tasks.add_task(update_session_not_scam)
+        return HackathonResponse(status="success", reply="", scamDetected=False)
+
+    # If SCAM and intel already sufficient, stop before generating a reply
+    temp_messages = conversation_history + [{"role": "scammer", "content": message_text}]
+    pre_intel = _merge_intel(session.get("extracted_intel"), _regex_extract_intel(_conversation_context(temp_messages)))
+    if _stop_condition_met(pre_intel):
+        session["messages"] = temp_messages
+        session["turn_count"] = len(session["messages"])
+        session["extracted_intel"] = _extract_intel_from_convo(session["messages"], pre_intel)
+
+        neutral_reply = os.environ.get("NEUTRAL_CLOSE_REPLY", "Okay, I will check and get back to you.")
+
+        response_doc = {
+            "session_id": session_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "response": {
+                "status": "success",
+                "reply": neutral_reply,
+                "scamDetected": True,
+            },
+            "agentNotes": _agent_notes(session),
+            "session_state": {
+                "turn_count": session["turn_count"],
+                "scam_detected": True,
+                "extracted_intel": session["extracted_intel"],
+            },
+        }
+
+        async def save_response_stop():
+            try:
+                await _save_to_mongodb("responses", response_doc)
+            except Exception as e:
+                logger.error(f"❌ MongoDB stop response save error: {e}", exc_info=True)
+
+        background_tasks.add_task(save_response_stop)
+
+        # Store scammer message
+        scammer_message_doc = {
+            "session_id": session_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "message": {
+                "role": "scammer",
+                "content": message_text,
+                "sender": req.message.sender,
+                "original_timestamp": req.message.timestamp,
+            },
+        }
+
+        async def save_scammer_stop():
+            try:
+                await _save_to_mongodb("messages", scammer_message_doc)
+            except Exception as e:
+                logger.error(f"❌ MongoDB stop scammer save error: {e}", exc_info=True)
+
+        background_tasks.add_task(save_scammer_stop)
+
+        # Store agent neutral closing reply
+        agent_message_doc = {
+            "session_id": session_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "message": {
+                "role": "agent",
+                "content": neutral_reply,
+            },
+        }
+
+        async def save_agent_stop():
+            try:
+                await _save_to_mongodb("messages", agent_message_doc)
+            except Exception as e:
+                logger.error(f"❌ MongoDB stop agent save error: {e}", exc_info=True)
+
+        background_tasks.add_task(save_agent_stop)
+
+        # Update session
+        session_doc = {
+            "session_id": session_id,
+            "updated_at": datetime.utcnow().isoformat(),
+            "turn_count": session["turn_count"],
+            "scam_detected": True,
+            "callback_sent": session.get("callback_sent", False),
+            "agent_notes": _agent_notes(session),
+            "extracted_intel": session["extracted_intel"],
+            "conversation_history": session["messages"] + [{"role": "agent", "content": neutral_reply}],
+            "metadata": req.metadata or {},
+        }
+
+        async def update_session_stop():
+            try:
+                existing = await _get_from_mongodb("sessions", {"session_id": session_id})
+                if existing:
+                    await _update_mongodb("sessions", {"session_id": session_id}, session_doc)
+                else:
+                    session_doc["created_at"] = datetime.utcnow().isoformat()
+                    await _save_to_mongodb("sessions", session_doc)
+            except Exception as e:
+                logger.error(f"❌ MongoDB stop session update error: {e}", exc_info=True)
+
+        background_tasks.add_task(update_session_stop)
+
+        # Final callback + store payload
+        callback_ok, callback_payload = _send_callback(session_id, session, neutral_reply)
+        if callback_ok:
+            session["callback_sent"] = True
+            logger.info(f"✅ Callback sent for session {session_id}")
+        else:
+            logger.warning(f"⚠️ Callback failed for session {session_id}")
+
+        callback_doc = {
+            "session_id": session_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "callback_url": os.environ.get("CALLBACK_URL", "").strip() or HACKATHON_CALLBACK_URL,
+            "ok": callback_ok,
+            "payload": callback_payload,
+        }
+
+        async def save_callback_stop():
+            try:
+                await _save_to_mongodb("callbacks", callback_doc)
+            except Exception as e:
+                logger.error(f"❌ MongoDB stop callback save error: {e}", exc_info=True)
+
+        background_tasks.add_task(save_callback_stop)
+
+        return HackathonResponse(status="success", reply=neutral_reply, scamDetected=True)
     
     # PHASE 2: Agent Engagement (if scam detected, or continue conversation)
     # Use full conversation history + RAG for natural multi-turn behavior
@@ -1028,7 +1533,7 @@ async def v1_chat(
     # Update session with new messages
     session["messages"].append({"role": "scammer", "content": message_text})
     session["messages"].append({"role": "agent", "content": out.reply})
-    session["turn_count"] = len([m for m in session["messages"] if m.get("role") == "agent"])
+    session["turn_count"] = len(session["messages"])
     
     # PHASE 3: Incremental Intelligence Extraction
     # Extract from full conversation, merge with previous
@@ -1044,7 +1549,9 @@ async def v1_chat(
         "response": {
             "status": "success",
             "reply": out.reply,
+            "scamDetected": True,
         },
+        "agentNotes": _agent_notes(session),
         "model_output": {
             "label": out.label,
             "confidence": out.confidence,
@@ -1123,6 +1630,8 @@ async def v1_chat(
         "updated_at": datetime.utcnow().isoformat(),
         "turn_count": session["turn_count"],
         "scam_detected": session["scam_detected"],
+        "callback_sent": session.get("callback_sent", False),
+        "agent_notes": _agent_notes(session),
         "extracted_intel": session["extracted_intel"],
         "conversation_history": session["messages"],
         "metadata": req.metadata or {},
@@ -1152,9 +1661,35 @@ async def v1_chat(
     # PHASE 4: Check if conversation should end
     # Note: For testing, we allow longer conversations. Only stop if truly necessary.
     ended = _should_stop(session)
-    if ended:
+    if ended and session.get("scam_detected", False) and not session.get("callback_sent", False):
         logger.info(f"Conversation ending. Intel items: {_intel_count(session['extracted_intel'])}, Turns: {session['turn_count']}")
-        _send_callback(session_id, session, out.reply)
+        callback_ok, callback_payload = _send_callback(session_id, session, out.reply)
+        if callback_ok:
+            session["callback_sent"] = True
+            logger.info(f"✅ Callback sent for session {session_id}")
+        else:
+            logger.warning(f"⚠️ Callback failed for session {session_id}")
+
+        # Save callback payload to MongoDB for auditing/debugging
+        callback_doc = {
+            "session_id": session_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "callback_url": os.environ.get("CALLBACK_URL", "").strip() or HACKATHON_CALLBACK_URL,
+            "ok": callback_ok,
+            "payload": callback_payload,
+        }
+
+        async def save_callback():
+            try:
+                result = await _save_to_mongodb("callbacks", callback_doc)
+                if result:
+                    logger.info(f"✅ MongoDB: Saved callback payload for session {session_id}")
+                else:
+                    logger.warning(f"⚠️ MongoDB: Failed to save callback payload for session {session_id}")
+            except Exception as e:
+                logger.error(f"❌ MongoDB callback save error: {e}", exc_info=True)
+
+        background_tasks.add_task(save_callback)
         
         # Store conversation end event
         end_doc = {
@@ -1182,7 +1717,7 @@ async def v1_chat(
         # Log progress for debugging
         logger.debug(f"Conversation continues. Intel: {_intel_count(session['extracted_intel'])}, Turns: {session['turn_count']}")
     
-    return HackathonResponse(status="success", reply=out.reply)
+    return HackathonResponse(status="success", reply=out.reply, scamDetected=True)
 
 
 class CompareRequest(BaseModel):
