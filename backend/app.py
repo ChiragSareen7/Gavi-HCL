@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -57,43 +58,36 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # ========== MongoDB Connection ==========
 _mongo_client: Optional[Any] = None
 _mongo_db: Optional[Any] = None
+_mongodb_available: bool = False
 
-def _init_mongodb():
-    """Initialize MongoDB connection. Reads MONGODB_URI from .env file."""
-    global _mongo_client, _mongo_db
-    
+
+async def _init_mongodb_async():
+    """Initialize MongoDB at app startup (uses uvicorn's event loop)."""
+    global _mongo_client, _mongo_db, _mongodb_available
+
     if not MONGO_AVAILABLE:
-        logger.warning("MongoDB not available - using in-memory storage only")
-        return False
-    
-    # Read from environment (loaded from .env file by dotenv)
-    mongo_uri = os.environ.get("MONGODB_URI", "mongodb://localhost:27017").strip()
-    db_name = os.environ.get("MONGODB_DB_NAME", "honeypot_db").strip()
-    
-    # Log connection attempt (without exposing credentials)
-    if mongo_uri and mongo_uri != "mongodb://localhost:27017":
-        logger.info(f"Connecting to MongoDB: {db_name} (URI from .env)")
-    else:
-        logger.info(f"Using default MongoDB: {db_name} (localhost)")
-    
+        logger.warning("MongoDB libraries not installed - using in-memory storage only")
+        return
+
+    mongo_uri = os.environ.get("MONGODB_URI", "").strip()
+    db_name = (os.environ.get("MONGODB_DB_NAME", "honeypot_db") or "").strip() or "honeypot_db"
+
+    if not mongo_uri:
+        logger.warning("MONGODB_URI not set - MongoDB storage disabled. Set MONGODB_URI in .env or environment.")
+        return
+
+    timeout_ms = 15000 if "mongodb+srv://" in mongo_uri else 5000
     try:
-        _mongo_client = AsyncIOMotorClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        _mongo_client = AsyncIOMotorClient(mongo_uri, serverSelectionTimeoutMS=timeout_ms)
         _mongo_db = _mongo_client[db_name]
-        # Test connection
-        import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(_mongo_client.admin.command('ping'))
-        logger.info(f"✅ MongoDB connected successfully: {db_name}")
-        return True
+        await _mongo_client.admin.command("ping")
+        _mongodb_available = True
+        logger.info(f"MongoDB connected successfully: database={db_name}")
     except (ConnectionFailure, ServerSelectionTimeoutError, Exception) as e:
         logger.warning(f"MongoDB connection failed: {e}. Using in-memory storage only.")
         _mongo_client = None
         _mongo_db = None
-        return False
-
-# Initialize MongoDB on import
-_mongodb_available = _init_mongodb()
+        _mongodb_available = False
 
 
 def _load_prompt(name: str) -> str:
@@ -348,7 +342,7 @@ _session_store: Dict[str, Dict[str, Any]] = {}
 
 async def _save_to_mongodb(collection: str, document: Dict[str, Any]) -> bool:
     """Save document to MongoDB. Returns True if successful."""
-    if not _mongodb_available or not _mongo_db:
+    if (not _mongodb_available) or (_mongo_db is None):
         logger.debug(f"MongoDB not available, skipping save to {collection}")
         return False
     
@@ -367,7 +361,7 @@ async def _save_to_mongodb(collection: str, document: Dict[str, Any]) -> bool:
 
 async def _get_from_mongodb(collection: str, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Get document from MongoDB. Returns None if not found or error."""
-    if not _mongodb_available or not _mongo_db:
+    if (not _mongodb_available) or (_mongo_db is None):
         return None
     
     try:
@@ -382,7 +376,7 @@ async def _get_from_mongodb(collection: str, query: Dict[str, Any]) -> Optional[
 
 async def _update_mongodb(collection: str, query: Dict[str, Any], update: Dict[str, Any]) -> bool:
     """Update document in MongoDB. Returns True if successful."""
-    if not _mongodb_available or not _mongo_db:
+    if not _mongodb_available or _mongo_db is None:
         return False
     
     try:
@@ -694,7 +688,18 @@ def _send_callback(session_id: str, session: Dict[str, Any], reply: str) -> bool
         return False
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup: connect to MongoDB. Shutdown: close client."""
+    await _init_mongodb_async()
+    yield
+    global _mongo_client
+    if _mongo_client is not None:
+        _mongo_client.close()
+        logger.info("MongoDB connection closed.")
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -779,7 +784,7 @@ async def health() -> Dict[str, Any]:
     
     # Test MongoDB connection
     mongo_test = False
-    if _mongodb_available and _mongo_client:
+    if _mongodb_available and _mongo_client is not None:
         try:
             await _mongo_client.admin.command('ping')
             mongo_test = True
@@ -791,7 +796,7 @@ async def health() -> Dict[str, Any]:
         "mongodb": mongo_status,
         "mongodb_available": _mongodb_available,
         "mongodb_connected": mongo_test,
-        "database": _mongo_db.name if _mongo_db else None
+        "database": _mongo_db.name if _mongo_db is not None else None
     }
 
 
@@ -816,7 +821,7 @@ def get_session_debug(session_id: str) -> Dict[str, Any]:
 @app.get("/debug/mongodb/stats")
 async def get_mongodb_stats() -> Dict[str, Any]:
     """Debug endpoint to check MongoDB collections and counts."""
-    if not _mongodb_available or not _mongo_db:
+    if not _mongodb_available or _mongo_db is None:
         return {
             "mongodb_available": False,
             "message": "MongoDB not connected"
@@ -845,7 +850,7 @@ async def get_mongodb_stats() -> Dict[str, Any]:
 @app.get("/debug/mongodb/session/{session_id}")
 async def get_mongodb_session(session_id: str) -> Dict[str, Any]:
     """Debug endpoint to get session data from MongoDB."""
-    if not _mongodb_available or not _mongo_db:
+    if not _mongodb_available or _mongo_db is None:
         return {
             "mongodb_available": False,
             "message": "MongoDB not connected"
